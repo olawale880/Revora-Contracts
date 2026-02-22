@@ -272,9 +272,7 @@ impl RevoraRevenueShare {
 
         // Store or validate payment token for this offering
         let pt_key = DataKey::PaymentToken(token.clone());
-        if let Some(existing_pt) =
-            env.storage().persistent().get::<DataKey, Address>(&pt_key)
-        {
+        if let Some(existing_pt) = env.storage().persistent().get::<DataKey, Address>(&pt_key) {
             if existing_pt != payment_token {
                 return Err(RevoraError::PaymentTokenMismatch);
             }
@@ -284,11 +282,7 @@ impl RevoraRevenueShare {
 
         // Transfer tokens from issuer to contract
         let contract_addr = env.current_contract_address();
-        token::Client::new(&env, &payment_token).transfer(
-            &issuer,
-            &contract_addr,
-            &amount,
-        );
+        token::Client::new(&env, &payment_token).transfer(&issuer, &contract_addr, &amount);
 
         // Store period revenue
         env.storage().persistent().set(&rev_key, &amount);
@@ -330,10 +324,8 @@ impl RevoraRevenueShare {
         let key = DataKey::HolderShare(token.clone(), holder.clone());
         env.storage().persistent().set(&key, &share_bps);
 
-        env.events().publish(
-            (EVENT_SHARE_SET, issuer, token),
-            (holder, share_bps),
-        );
+        env.events()
+            .publish((EVENT_SHARE_SET, issuer, token), (holder, share_bps));
         Ok(())
     }
 

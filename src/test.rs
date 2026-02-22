@@ -567,7 +567,13 @@ fn create_payment_token(env: &Env) -> (Address, Address) {
 }
 
 /// Mint `amount` of payment token to `recipient`.
-fn mint_tokens(env: &Env, payment_token: &Address, admin: &Address, recipient: &Address, amount: &i128) {
+fn mint_tokens(
+    env: &Env,
+    payment_token: &Address,
+    admin: &Address,
+    recipient: &Address,
+    amount: &i128,
+) {
     let _ = admin;
     token::StellarAssetClient::new(env, payment_token).mint(recipient, amount);
 }
@@ -578,7 +584,14 @@ fn balance(env: &Env, payment_token: &Address, who: &Address) -> i128 {
 }
 
 /// Full setup for claim tests: env, client, issuer, offering token, payment token, contract addr.
-fn claim_setup() -> (Env, RevoraRevenueShareClient<'static>, Address, Address, Address, Address) {
+fn claim_setup() -> (
+    Env,
+    RevoraRevenueShareClient<'static>,
+    Address,
+    Address,
+    Address,
+    Address,
+) {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register_contract(None, RevoraRevenueShare);
@@ -667,7 +680,10 @@ fn deposit_revenue_transfers_tokens() {
     let issuer_balance_before = balance(&env, &payment_token, &issuer);
     client.deposit_revenue(&issuer, &token, &payment_token, &100_000, &1);
 
-    assert_eq!(balance(&env, &payment_token, &issuer), issuer_balance_before - 100_000);
+    assert_eq!(
+        balance(&env, &payment_token, &issuer),
+        issuer_balance_before - 100_000
+    );
     assert_eq!(balance(&env, &payment_token, &contract_id), 100_000);
 }
 
@@ -703,9 +719,9 @@ fn deposit_revenue_requires_auth() {
     // Clear auth mocks - deposit should fail
     let env2 = Env::default();
     let _ = env2; // force no-auth environment
-    // Re-create without mock to test auth
-    // Actually, we need to test within the same env.
-    // The simplest way: create a fresh env without mock_all_auths
+                  // Re-create without mock to test auth
+                  // Actually, we need to test within the same env.
+                  // The simplest way: create a fresh env without mock_all_auths
     let env_no_auth = Env::default();
     let cid = env_no_auth.register_contract(None, RevoraRevenueShare);
     let client2 = RevoraRevenueShareClient::new(&env_no_auth, &cid);
@@ -837,7 +853,7 @@ fn claim_multiple_periods_aggregated() {
 
     // Claim all 3 periods in one transaction
     let payout = client.claim(&holder, &token, &0); // 0 = claim all
-    // 20% of (100k + 200k + 300k) = 20% of 600k = 120k
+                                                    // 20% of (100k + 200k + 300k) = 20% of 600k = 120k
     assert_eq!(payout, 120_000);
     assert_eq!(balance(&env, &payment_token, &holder), 120_000);
 }
@@ -1375,7 +1391,7 @@ fn offering_isolation_claims_independent() {
 
     let holder = Address::generate(&env);
 
-    client.set_holder_share(&issuer, &token, &holder, &5_000);   // 50% of offering A
+    client.set_holder_share(&issuer, &token, &holder, &5_000); // 50% of offering A
     client.set_holder_share(&issuer, &token_b, &holder, &10_000); // 100% of offering B
 
     client.deposit_revenue(&issuer, &token, &payment_token, &100_000, &1);
@@ -1384,8 +1400,8 @@ fn offering_isolation_claims_independent() {
     let payout_a = client.claim(&holder, &token, &0);
     let payout_b = client.claim(&holder, &token_b, &0);
 
-    assert_eq!(payout_a, 50_000);  // 50% of 100k
-    assert_eq!(payout_b, 50_000);  // 100% of 50k
+    assert_eq!(payout_a, 50_000); // 50% of 100k
+    assert_eq!(payout_b, 50_000); // 100% of 50k
 
     // Verify token A claim doesn't affect token B pending
     assert_eq!(client.get_pending_periods(&token, &holder).len(), 0);
