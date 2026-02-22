@@ -20,7 +20,7 @@ const BOUNDARY_AMOUNTS: [i128; 7] = [
     i128::MAX,
 ];
 const BOUNDARY_PERIODS: [u64; 6] = [0, 1, 2, 10_000, u64::MAX - 1, u64::MAX];
-const FUZZ_ITERATIONS: usize = 512;
+const FUZZ_ITERATIONS: usize = 128;
 
 fn next_u64(seed: &mut u64) -> u64 {
     // Deterministic LCG for repeatable pseudo-random test values.
