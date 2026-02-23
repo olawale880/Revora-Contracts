@@ -80,15 +80,15 @@ fn fuzz_period_and_amount_repeatable_sweep_do_not_panic() {
     let token = Address::generate(&env);
 
     // Same seed must produce the exact same sequence.
-    let mut seed_a = 0xA11C_E5ED_19u64;
-    let mut seed_b = 0xA11C_E5ED_19u64;
+    let mut seed_a = 0x00A1_1CE5_ED19_u64;
+    let mut seed_b = 0x00A1_1CE5_ED19_u64;
     for _ in 0..64 {
         assert_eq!(next_amount(&mut seed_a), next_amount(&mut seed_b));
         assert_eq!(next_period(&mut seed_a), next_period(&mut seed_b));
     }
 
     // Reset and run deterministic fuzz-style inputs through contract entrypoint.
-    let mut seed = 0xA11C_E5ED_19u64;
+    let mut seed = 0x00A1_1CE5_ED19_u64;
     for i in 0..FUZZ_ITERATIONS {
         let mut amount = next_amount(&mut seed);
         let mut period = next_period(&mut seed);
