@@ -31,6 +31,12 @@ pub enum RevoraError {
     ContractFrozen = 10,
     /// Revenue for this period is not yet claimable (delay not elapsed).
     ClaimDelayNotElapsed = 11,
+    /// A transfer is already pending for this offering.
+    IssuerTransferPending = 12,
+    /// No transfer is pending for this offering.
+    NoTransferPending = 13,
+    /// Caller is not authorized to accept this transfer.
+    UnauthorizedTransferAccept = 14,
 }
 
 // ── Event symbols ────────────────────────────────────────────
@@ -43,6 +49,9 @@ const EVENT_CLAIM: Symbol = symbol_short!("claim");
 const EVENT_SHARE_SET: Symbol = symbol_short!("share_set");
 const EVENT_FREEZE: Symbol = symbol_short!("freeze");
 const EVENT_CLAIM_DELAY_SET: Symbol = symbol_short!("delay_set");
+const EVENT_ISSUER_TRANSFER_PROPOSED: Symbol = symbol_short!("iss_prop");
+const EVENT_ISSUER_TRANSFER_ACCEPTED: Symbol = symbol_short!("iss_acc");
+const EVENT_ISSUER_TRANSFER_CANCELLED: Symbol = symbol_short!("iss_canc");
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -128,6 +137,10 @@ pub enum DataKey {
     Admin,
     /// Contract frozen flag; when true, state-changing ops are disabled (#32).
     Frozen,
+    /// Pending issuer transfer for an offering token: token -> new_issuer.
+    PendingIssuerTransfer(Address),
+    /// Current issuer lookup by offering token: token -> issuer.
+    OfferingIssuer(Address),
 }
 
 /// Maximum number of offerings returned in a single page.
@@ -154,6 +167,12 @@ impl RevoraRevenueShare {
             return Err(RevoraError::ContractFrozen);
         }
         Ok(())
+    }
+
+    /// Get the current issuer for an offering token (used for auth checks after transfers).
+    fn get_current_issuer(env: &Env, token: &Address) -> Option<Address> {
+        let key = DataKey::OfferingIssuer(token.clone());
+        env.storage().persistent().get(&key)
     }
 
     /// Register a new revenue-share offering.
@@ -183,6 +202,12 @@ impl RevoraRevenueShare {
         let item_key = DataKey::OfferItem(issuer.clone(), count);
         env.storage().persistent().set(&item_key, &offering);
         env.storage().persistent().set(&count_key, &(count + 1));
+
+        // Maintain reverse lookup: token -> issuer
+        let issuer_lookup_key = DataKey::OfferingIssuer(token.clone());
+        env.storage()
+            .persistent()
+            .set(&issuer_lookup_key, &issuer);
 
         env.events().publish(
             (symbol_short!("offer_reg"), issuer),
@@ -224,6 +249,15 @@ impl RevoraRevenueShare {
         period_id: u64,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
+
+        // Verify offering exists and issuer is current
+        let current_issuer = Self::get_current_issuer(&env, &token)
+            .ok_or(RevoraError::OfferingNotFound)?;
+        
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
+
         issuer.require_auth();
 
         // Holder concentration guardrail (#26): reject if enforce and over limit
@@ -387,10 +421,16 @@ impl RevoraRevenueShare {
         enforce: bool,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
-        issuer.require_auth();
-        if Self::get_offering(env.clone(), issuer.clone(), token.clone()).is_none() {
-            return Err(RevoraError::LimitReached); // reuse: "offering not found" semantics
+
+        // Verify offering exists and issuer is current
+        let current_issuer = Self::get_current_issuer(&env, &token)
+            .ok_or(RevoraError::LimitReached)?;
+        
+        if current_issuer != issuer {
+            return Err(RevoraError::LimitReached);
         }
+
+        issuer.require_auth();
         let key = DataKey::ConcentrationLimit(issuer, token);
         env.storage()
             .persistent()
@@ -406,6 +446,15 @@ impl RevoraRevenueShare {
         concentration_bps: u32,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
+
+        // Verify offering exists and issuer is current
+        let current_issuer = Self::get_current_issuer(&env, &token)
+            .ok_or(RevoraError::OfferingNotFound)?;
+        
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
+
         issuer.require_auth();
         let curr_key = DataKey::CurrentConcentration(issuer.clone(), token.clone());
         env.storage()
@@ -462,10 +511,16 @@ impl RevoraRevenueShare {
         mode: RoundingMode,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
-        issuer.require_auth();
-        if Self::get_offering(env.clone(), issuer.clone(), token.clone()).is_none() {
+
+        // Verify offering exists and issuer is current
+        let current_issuer = Self::get_current_issuer(&env, &token)
+            .ok_or(RevoraError::LimitReached)?;
+        
+        if current_issuer != issuer {
             return Err(RevoraError::LimitReached);
         }
+
+        issuer.require_auth();
         let key = DataKey::RoundingMode(issuer, token);
         env.storage().persistent().set(&key, &mode);
         Ok(())
@@ -527,12 +582,16 @@ impl RevoraRevenueShare {
         period_id: u64,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
-        issuer.require_auth();
 
-        // Verify offering exists
-        if Self::get_offering(env.clone(), issuer.clone(), token.clone()).is_none() {
+        // Verify offering exists and issuer is current
+        let current_issuer = Self::get_current_issuer(&env, &token)
+            .ok_or(RevoraError::OfferingNotFound)?;
+        
+        if current_issuer != issuer {
             return Err(RevoraError::OfferingNotFound);
         }
+
+        issuer.require_auth();
 
         // Check period not already deposited
         let rev_key = DataKey::PeriodRevenue(token.clone(), period_id);
@@ -587,11 +646,16 @@ impl RevoraRevenueShare {
         share_bps: u32,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
-        issuer.require_auth();
 
-        if Self::get_offering(env.clone(), issuer.clone(), token.clone()).is_none() {
+        // Verify offering exists and issuer is current
+        let current_issuer = Self::get_current_issuer(&env, &token)
+            .ok_or(RevoraError::OfferingNotFound)?;
+        
+        if current_issuer != issuer {
             return Err(RevoraError::OfferingNotFound);
         }
+
+        issuer.require_auth();
 
         if share_bps > 10_000 {
             return Err(RevoraError::InvalidShareBps);
@@ -767,10 +831,16 @@ impl RevoraRevenueShare {
         delay_secs: u64,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
-        issuer.require_auth();
-        if Self::get_offering(env.clone(), issuer.clone(), token.clone()).is_none() {
+
+        // Verify offering exists and issuer is current
+        let current_issuer = Self::get_current_issuer(&env, &token)
+            .ok_or(RevoraError::OfferingNotFound)?;
+        
+        if current_issuer != issuer {
             return Err(RevoraError::OfferingNotFound);
         }
+
+        issuer.require_auth();
         let key = DataKey::ClaimDelaySecs(token.clone());
         env.storage().persistent().set(&key, &delay_secs);
         env.events()
@@ -862,6 +932,146 @@ impl RevoraRevenueShare {
             .persistent()
             .get::<DataKey, bool>(&DataKey::Frozen)
             .unwrap_or(false)
+    }
+
+    // ── Secure issuer transfer (two-step flow) ─────────────────
+
+    /// Propose transferring issuer control of an offering to a new address.
+    /// Only the current issuer may call this. Initiates a two-step transfer.
+    pub fn propose_issuer_transfer(
+        env: Env,
+        token: Address,
+        new_issuer: Address,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+
+        // Get current issuer and verify offering exists
+        let current_issuer = Self::get_current_issuer(&env, &token)
+            .ok_or(RevoraError::OfferingNotFound)?;
+
+        // Only current issuer can propose transfer
+        current_issuer.require_auth();
+
+        // Check if transfer already pending
+        let pending_key = DataKey::PendingIssuerTransfer(token.clone());
+        if env.storage().persistent().has(&pending_key) {
+            return Err(RevoraError::IssuerTransferPending);
+        }
+
+        // Store pending transfer
+        env.storage()
+            .persistent()
+            .set(&pending_key, &new_issuer);
+
+        env.events().publish(
+            (EVENT_ISSUER_TRANSFER_PROPOSED, token.clone()),
+            (current_issuer, new_issuer),
+        );
+
+        Ok(())
+    }
+
+    /// Accept a pending issuer transfer. Only the proposed new issuer may call this.
+    /// Completes the two-step transfer and grants full issuer control to the new address.
+    pub fn accept_issuer_transfer(env: Env, token: Address) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+
+        // Get pending transfer
+        let pending_key = DataKey::PendingIssuerTransfer(token.clone());
+        let new_issuer: Address = env
+            .storage()
+            .persistent()
+            .get(&pending_key)
+            .ok_or(RevoraError::NoTransferPending)?;
+
+        // Only the proposed new issuer can accept
+        new_issuer.require_auth();
+
+        // Get current issuer
+        let old_issuer = Self::get_current_issuer(&env, &token)
+            .ok_or(RevoraError::OfferingNotFound)?;
+
+        // Update the offering's issuer field in storage
+        // We need to find and update the offering
+        let offering = Self::get_offering(env.clone(), old_issuer.clone(), token.clone())
+            .ok_or(RevoraError::OfferingNotFound)?;
+
+        // Find the index of this offering
+        let count = Self::get_offering_count(env.clone(), old_issuer.clone());
+        let mut found_index: Option<u32> = None;
+        for i in 0..count {
+            let item_key = DataKey::OfferItem(old_issuer.clone(), i);
+            let stored_offering: Offering = env.storage().persistent().get(&item_key).unwrap();
+            if stored_offering.token == token {
+                found_index = Some(i);
+                break;
+            }
+        }
+
+        let index = found_index.ok_or(RevoraError::OfferingNotFound)?;
+
+        // Update the offering with new issuer
+        let updated_offering = Offering {
+            issuer: new_issuer.clone(),
+            token: token.clone(),
+            revenue_share_bps: offering.revenue_share_bps,
+        };
+
+        // Write back to same storage location
+        let item_key = DataKey::OfferItem(old_issuer.clone(), index);
+        env.storage().persistent().set(&item_key, &updated_offering);
+
+        // Update reverse lookup
+        let issuer_lookup_key = DataKey::OfferingIssuer(token.clone());
+        env.storage()
+            .persistent()
+            .set(&issuer_lookup_key, &new_issuer);
+
+        // Clear pending transfer
+        env.storage().persistent().remove(&pending_key);
+
+        env.events().publish(
+            (EVENT_ISSUER_TRANSFER_ACCEPTED, token),
+            (old_issuer, new_issuer),
+        );
+
+        Ok(())
+    }
+
+    /// Cancel a pending issuer transfer. Only the current issuer may call this.
+    pub fn cancel_issuer_transfer(env: Env, token: Address) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+
+        // Get current issuer
+        let current_issuer = Self::get_current_issuer(&env, &token)
+            .ok_or(RevoraError::OfferingNotFound)?;
+
+        // Only current issuer can cancel
+        current_issuer.require_auth();
+
+        // Check if transfer is pending
+        let pending_key = DataKey::PendingIssuerTransfer(token.clone());
+        let proposed_new_issuer: Address = env
+            .storage()
+            .persistent()
+            .get(&pending_key)
+            .ok_or(RevoraError::NoTransferPending)?;
+
+        // Clear pending transfer
+        env.storage().persistent().remove(&pending_key);
+
+        env.events().publish(
+            (EVENT_ISSUER_TRANSFER_CANCELLED, token),
+            (current_issuer, proposed_new_issuer),
+        );
+
+        Ok(())
+    }
+
+    /// Get the pending issuer transfer for an offering, if any.
+    pub fn get_pending_issuer_transfer(env: Env, token: Address) -> Option<Address> {
+        let pending_key = DataKey::PendingIssuerTransfer(token);
+        env.storage().persistent().get(&pending_key)
     }
 }
 

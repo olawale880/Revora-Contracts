@@ -1876,3 +1876,498 @@ fn freeze_succeeds_when_called_by_admin() {
     assert!(r.is_ok());
     assert!(client.is_frozen());
 }
+
+// ===========================================================================
+// Secure issuer transfer tests (two-step propose/accept flow)
+// ===========================================================================
+
+// ── Happy path tests ──────────────────────────────────────────
+
+#[test]
+fn issuer_transfer_propose_stores_pending() {
+    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let new_issuer = Address::generate(&env);
+
+    client.propose_issuer_transfer(&token, &new_issuer);
+
+    let pending = client.get_pending_issuer_transfer(&token);
+    assert_eq!(pending, Some(new_issuer));
+}
+
+#[test]
+fn issuer_transfer_propose_emits_event() {
+    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let new_issuer = Address::generate(&env);
+
+    let before = env.events().all().len();
+    client.propose_issuer_transfer(&token, &new_issuer);
+    assert!(env.events().all().len() > before);
+}
+
+#[test]
+fn issuer_transfer_accept_completes_transfer() {
+    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let new_issuer = Address::generate(&env);
+
+    client.propose_issuer_transfer(&token, &new_issuer);
+    client.accept_issuer_transfer(&token);
+
+    // Verify no pending transfer after acceptance
+    assert_eq!(client.get_pending_issuer_transfer(&token), None);
+
+    // Verify offering issuer is updated
+    let offering = client.get_offering(&issuer, &token);
+    assert!(offering.is_some());
+    assert_eq!(offering.unwrap().issuer, new_issuer);
+}
+
+#[test]
+fn issuer_transfer_accept_emits_event() {
+    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let new_issuer = Address::generate(&env);
+
+    client.propose_issuer_transfer(&token, &new_issuer);
+    let before = env.events().all().len();
+    client.accept_issuer_transfer(&token);
+    assert!(env.events().all().len() > before);
+}
+
+#[test]
+fn issuer_transfer_new_issuer_can_deposit_revenue() {
+    let (env, client, issuer, token, payment_token, _contract_id) = claim_setup();
+    let new_issuer = Address::generate(&env);
+
+    // Mint tokens to new issuer
+    let (_, pt_admin) = create_payment_token(&env);
+    mint_tokens(&env, &payment_token, &pt_admin, &new_issuer, &5_000_000);
+
+    client.propose_issuer_transfer(&token, &new_issuer);
+    client.accept_issuer_transfer(&token);
+
+    // New issuer should be able to deposit revenue
+    let result = client.try_deposit_revenue(&new_issuer, &token, &payment_token, &100_000, &1);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn issuer_transfer_new_issuer_can_set_holder_share() {
+    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let new_issuer = Address::generate(&env);
+    let holder = Address::generate(&env);
+
+    client.propose_issuer_transfer(&token, &new_issuer);
+    client.accept_issuer_transfer(&token);
+
+    // New issuer should be able to set holder shares
+    let result = client.try_set_holder_share(&new_issuer, &token, &holder, &5_000);
+    assert!(result.is_ok());
+    assert_eq!(client.get_holder_share(&token, &holder), 5_000);
+}
+
+#[test]
+fn issuer_transfer_old_issuer_loses_access() {
+    let (env, client, issuer, token, payment_token, _contract_id) = claim_setup();
+    let new_issuer = Address::generate(&env);
+
+    client.propose_issuer_transfer(&token, &new_issuer);
+    client.accept_issuer_transfer(&token);
+
+    // Old issuer should not be able to deposit revenue
+    let result = client.try_deposit_revenue(&issuer, &token, &payment_token, &100_000, &1);
+    assert!(result.is_err());
+}
+
+#[test]
+fn issuer_transfer_old_issuer_cannot_set_holder_share() {
+    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let new_issuer = Address::generate(&env);
+    let holder = Address::generate(&env);
+
+    client.propose_issuer_transfer(&token, &new_issuer);
+    client.accept_issuer_transfer(&token);
+
+    // Old issuer should not be able to set holder shares
+    let result = client.try_set_holder_share(&issuer, &token, &holder, &5_000);
+    assert!(result.is_err());
+}
+
+#[test]
+fn issuer_transfer_cancel_clears_pending() {
+    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let new_issuer = Address::generate(&env);
+
+    client.propose_issuer_transfer(&token, &new_issuer);
+    client.cancel_issuer_transfer(&token);
+
+    assert_eq!(client.get_pending_issuer_transfer(&token), None);
+}
+
+#[test]
+fn issuer_transfer_cancel_emits_event() {
+    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let new_issuer = Address::generate(&env);
+
+    client.propose_issuer_transfer(&token, &new_issuer);
+    let before = env.events().all().len();
+    client.cancel_issuer_transfer(&token);
+    assert!(env.events().all().len() > before);
+}
+
+#[test]
+fn issuer_transfer_cancel_then_can_propose_again() {
+    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let new_issuer_1 = Address::generate(&env);
+    let new_issuer_2 = Address::generate(&env);
+
+    client.propose_issuer_transfer(&token, &new_issuer_1);
+    client.cancel_issuer_transfer(&token);
+    
+    // Should be able to propose to different address
+    let result = client.try_propose_issuer_transfer(&token, &new_issuer_2);
+    assert!(result.is_ok());
+    assert_eq!(client.get_pending_issuer_transfer(&token), Some(new_issuer_2));
+}
+
+// ── Security and abuse prevention tests ──────────────────────
+
+#[test]
+fn issuer_transfer_cannot_propose_for_nonexistent_offering() {
+    let (env, client, _issuer, _token, _payment_token, _contract_id) = claim_setup();
+    let unknown_token = Address::generate(&env);
+    let new_issuer = Address::generate(&env);
+
+    let result = client.try_propose_issuer_transfer(&unknown_token, &new_issuer);
+    assert!(result.is_err());
+}
+
+#[test]
+fn issuer_transfer_cannot_propose_when_already_pending() {
+    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let new_issuer_1 = Address::generate(&env);
+    let new_issuer_2 = Address::generate(&env);
+
+    client.propose_issuer_transfer(&token, &new_issuer_1);
+    
+    // Second proposal should fail
+    let result = client.try_propose_issuer_transfer(&token, &new_issuer_2);
+    assert!(result.is_err());
+}
+
+#[test]
+fn issuer_transfer_cannot_accept_when_no_pending() {
+    let (env, client, _issuer, token, _payment_token, _contract_id) = claim_setup();
+    let some_address = Address::generate(&env);
+
+    let result = client.try_accept_issuer_transfer(&token);
+    assert!(result.is_err());
+}
+
+#[test]
+fn issuer_transfer_cannot_cancel_when_no_pending() {
+    let (env, client, _issuer, token, _payment_token, _contract_id) = claim_setup();
+
+    let result = client.try_cancel_issuer_transfer(&token);
+    assert!(result.is_err());
+}
+
+#[test]
+#[should_panic]
+fn issuer_transfer_propose_requires_auth() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, RevoraRevenueShare);
+    let client = RevoraRevenueShareClient::new(&env, &contract_id);
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    let new_issuer = Address::generate(&env);
+
+    // No mock_all_auths - should panic
+    client.propose_issuer_transfer(&token, &new_issuer);
+}
+
+#[test]
+#[should_panic]
+fn issuer_transfer_accept_requires_auth() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, RevoraRevenueShare);
+    let client = RevoraRevenueShareClient::new(&env, &contract_id);
+    let token = Address::generate(&env);
+
+    // No mock_all_auths - should panic
+    client.accept_issuer_transfer(&token);
+}
+
+#[test]
+#[should_panic]
+fn issuer_transfer_cancel_requires_auth() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, RevoraRevenueShare);
+    let client = RevoraRevenueShareClient::new(&env, &contract_id);
+    let token = Address::generate(&env);
+
+    // No mock_all_auths - should panic
+    client.cancel_issuer_transfer(&token);
+}
+
+#[test]
+fn issuer_transfer_double_accept_fails() {
+    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let new_issuer = Address::generate(&env);
+
+    client.propose_issuer_transfer(&token, &new_issuer);
+    client.accept_issuer_transfer(&token);
+    
+    // Second accept should fail (no pending transfer)
+    let result = client.try_accept_issuer_transfer(&token);
+    assert!(result.is_err());
+}
+
+// ── Edge case tests ───────────────────────────────────────────
+
+#[test]
+fn issuer_transfer_to_same_address() {
+    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+
+    // Transfer to self
+    let result = client.try_propose_issuer_transfer(&token, &issuer);
+    assert!(result.is_ok());
+    
+    let result = client.try_accept_issuer_transfer(&token);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn issuer_transfer_multiple_offerings_isolation() {
+    let (env, client, issuer, token_a, _payment_token, _contract_id) = claim_setup();
+    let token_b = Address::generate(&env);
+    let new_issuer_a = Address::generate(&env);
+    let new_issuer_b = Address::generate(&env);
+
+    // Register second offering
+    client.register_offering(&issuer, &token_b, &3_000);
+
+    // Propose transfers for both
+    client.propose_issuer_transfer(&token_a, &new_issuer_a);
+    client.propose_issuer_transfer(&token_b, &new_issuer_b);
+
+    // Accept only token_a transfer
+    client.accept_issuer_transfer(&token_a);
+
+    // Verify token_a transferred but token_b still pending
+    assert_eq!(client.get_pending_issuer_transfer(&token_a), None);
+    assert_eq!(client.get_pending_issuer_transfer(&token_b), Some(new_issuer_b));
+}
+
+#[test]
+fn issuer_transfer_blocked_when_frozen() {
+    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let new_issuer = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    client.set_admin(&admin);
+    client.freeze();
+
+    let result = client.try_propose_issuer_transfer(&token, &new_issuer);
+    assert!(result.is_err());
+}
+
+#[test]
+fn issuer_transfer_accept_blocked_when_frozen() {
+    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let new_issuer = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    client.propose_issuer_transfer(&token, &new_issuer);
+    
+    client.set_admin(&admin);
+    client.freeze();
+
+    let result = client.try_accept_issuer_transfer(&token);
+    assert!(result.is_err());
+}
+
+#[test]
+fn issuer_transfer_cancel_blocked_when_frozen() {
+    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let new_issuer = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    client.propose_issuer_transfer(&token, &new_issuer);
+    
+    client.set_admin(&admin);
+    client.freeze();
+
+    let result = client.try_cancel_issuer_transfer(&token);
+    assert!(result.is_err());
+}
+
+// ── Integration tests with other features ─────────────────────
+
+#[test]
+fn issuer_transfer_preserves_audit_summary() {
+    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let new_issuer = Address::generate(&env);
+
+    // Report revenue before transfer
+    client.report_revenue(&issuer, &token, &100_000, &1);
+    let summary_before = client.get_audit_summary(&issuer, &token).unwrap();
+
+    // Transfer issuer
+    client.propose_issuer_transfer(&token, &new_issuer);
+    client.accept_issuer_transfer(&token);
+
+    // Audit summary should still be accessible
+    let summary_after = client.get_audit_summary(&issuer, &token).unwrap();
+    assert_eq!(summary_before.total_revenue, summary_after.total_revenue);
+    assert_eq!(summary_before.report_count, summary_after.report_count);
+}
+
+#[test]
+fn issuer_transfer_new_issuer_can_report_revenue() {
+    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let new_issuer = Address::generate(&env);
+
+    client.propose_issuer_transfer(&token, &new_issuer);
+    client.accept_issuer_transfer(&token);
+
+    // New issuer can report revenue
+    let result = client.try_report_revenue(&new_issuer, &token, &200_000, &2);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn issuer_transfer_new_issuer_can_set_concentration_limit() {
+    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let new_issuer = Address::generate(&env);
+
+    client.propose_issuer_transfer(&token, &new_issuer);
+    client.accept_issuer_transfer(&token);
+
+    // New issuer can set concentration limit
+    let result = client.try_set_concentration_limit(&new_issuer, &token, &5_000, &true);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn issuer_transfer_new_issuer_can_set_rounding_mode() {
+    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let new_issuer = Address::generate(&env);
+
+    client.propose_issuer_transfer(&token, &new_issuer);
+    client.accept_issuer_transfer(&token);
+
+    // New issuer can set rounding mode
+    let result = client.try_set_rounding_mode(&new_issuer, &token, &RoundingMode::RoundHalfUp);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn issuer_transfer_new_issuer_can_set_claim_delay() {
+    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let new_issuer = Address::generate(&env);
+
+    client.propose_issuer_transfer(&token, &new_issuer);
+    client.accept_issuer_transfer(&token);
+
+    // New issuer can set claim delay
+    let result = client.try_set_claim_delay(&new_issuer, &token, &3600);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn issuer_transfer_holders_can_still_claim() {
+    let (env, client, issuer, token, payment_token, _contract_id) = claim_setup();
+    let holder = Address::generate(&env);
+    let new_issuer = Address::generate(&env);
+
+    // Setup: deposit and set share before transfer
+    client.set_holder_share(&issuer, &token, &holder, &10_000);
+    client.deposit_revenue(&issuer, &token, &payment_token, &100_000, &1);
+
+    // Transfer issuer
+    client.propose_issuer_transfer(&token, &new_issuer);
+    client.accept_issuer_transfer(&token);
+
+    // Holder should still be able to claim
+    let payout = client.claim(&holder, &token, &0);
+    assert_eq!(payout, 100_000);
+}
+
+#[test]
+fn issuer_transfer_then_new_deposits_and_claims_work() {
+    let (env, client, issuer, token, payment_token, _contract_id) = claim_setup();
+    let holder = Address::generate(&env);
+    let new_issuer = Address::generate(&env);
+
+    // Mint tokens to new issuer
+    let (_, pt_admin) = create_payment_token(&env);
+    mint_tokens(&env, &payment_token, &pt_admin, &new_issuer, &5_000_000);
+
+    // Transfer issuer
+    client.propose_issuer_transfer(&token, &new_issuer);
+    client.accept_issuer_transfer(&token);
+
+    // New issuer sets share and deposits
+    client.set_holder_share(&new_issuer, &token, &holder, &5_000);
+    client.deposit_revenue(&new_issuer, &token, &payment_token, &200_000, &1);
+
+    // Holder claims
+    let payout = client.claim(&holder, &token, &0);
+    assert_eq!(payout, 100_000); // 50% of 200k
+}
+
+#[test]
+fn issuer_transfer_get_offering_still_works() {
+    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let new_issuer = Address::generate(&env);
+
+    client.propose_issuer_transfer(&token, &new_issuer);
+    client.accept_issuer_transfer(&token);
+
+    // get_offering should still find the offering under old issuer key
+    let offering = client.get_offering(&issuer, &token);
+    assert!(offering.is_some());
+    assert_eq!(offering.unwrap().issuer, new_issuer);
+}
+
+#[test]
+fn issuer_transfer_preserves_revenue_share_bps() {
+    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let new_issuer = Address::generate(&env);
+
+    let offering_before = client.get_offering(&issuer, &token).unwrap();
+
+    client.propose_issuer_transfer(&token, &new_issuer);
+    client.accept_issuer_transfer(&token);
+
+    let offering_after = client.get_offering(&issuer, &token).unwrap();
+    assert_eq!(offering_before.revenue_share_bps, offering_after.revenue_share_bps);
+}
+
+#[test]
+fn issuer_transfer_old_issuer_cannot_report_concentration() {
+    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let new_issuer = Address::generate(&env);
+
+    client.propose_issuer_transfer(&token, &new_issuer);
+    client.accept_issuer_transfer(&token);
+
+    // Old issuer should not be able to report concentration
+    let result = client.try_report_concentration(&issuer, &token, &5_000);
+    assert!(result.is_err());
+}
+
+#[test]
+fn issuer_transfer_new_issuer_can_report_concentration() {
+    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let new_issuer = Address::generate(&env);
+
+    client.set_concentration_limit(&issuer, &token, &6_000, &false);
+    
+    client.propose_issuer_transfer(&token, &new_issuer);
+    client.accept_issuer_transfer(&token);
+
+    // New issuer can report concentration
+    let result = client.try_report_concentration(&new_issuer, &token, &5_000);
+    assert!(result.is_ok());
+}
+
