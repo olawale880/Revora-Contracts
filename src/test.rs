@@ -1885,7 +1885,7 @@ fn freeze_succeeds_when_called_by_admin() {
 
 #[test]
 fn issuer_transfer_propose_stores_pending() {
-    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let (env, client, _issuer, token, _payment_token, _contract_id) = claim_setup();
     let new_issuer = Address::generate(&env);
 
     client.propose_issuer_transfer(&token, &new_issuer);
@@ -1896,7 +1896,7 @@ fn issuer_transfer_propose_stores_pending() {
 
 #[test]
 fn issuer_transfer_propose_emits_event() {
-    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let (env, client, _issuer, token, _payment_token, _contract_id) = claim_setup();
     let new_issuer = Address::generate(&env);
 
     let before = env.events().all().len();
@@ -1923,7 +1923,7 @@ fn issuer_transfer_accept_completes_transfer() {
 
 #[test]
 fn issuer_transfer_accept_emits_event() {
-    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let (env, client, _issuer, token, _payment_token, _contract_id) = claim_setup();
     let new_issuer = Address::generate(&env);
 
     client.propose_issuer_transfer(&token, &new_issuer);
@@ -1934,7 +1934,7 @@ fn issuer_transfer_accept_emits_event() {
 
 #[test]
 fn issuer_transfer_new_issuer_can_deposit_revenue() {
-    let (env, client, issuer, token, payment_token, _contract_id) = claim_setup();
+    let (env, client, _issuer, token, payment_token, _contract_id) = claim_setup();
     let new_issuer = Address::generate(&env);
 
     // Mint tokens to new issuer
@@ -1951,7 +1951,7 @@ fn issuer_transfer_new_issuer_can_deposit_revenue() {
 
 #[test]
 fn issuer_transfer_new_issuer_can_set_holder_share() {
-    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let (env, client, _issuer, token, _payment_token, _contract_id) = claim_setup();
     let new_issuer = Address::generate(&env);
     let holder = Address::generate(&env);
 
@@ -1993,7 +1993,7 @@ fn issuer_transfer_old_issuer_cannot_set_holder_share() {
 
 #[test]
 fn issuer_transfer_cancel_clears_pending() {
-    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let (env, client, _issuer, token, _payment_token, _contract_id) = claim_setup();
     let new_issuer = Address::generate(&env);
 
     client.propose_issuer_transfer(&token, &new_issuer);
@@ -2004,7 +2004,7 @@ fn issuer_transfer_cancel_clears_pending() {
 
 #[test]
 fn issuer_transfer_cancel_emits_event() {
-    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let (env, client, _issuer, token, _payment_token, _contract_id) = claim_setup();
     let new_issuer = Address::generate(&env);
 
     client.propose_issuer_transfer(&token, &new_issuer);
@@ -2015,7 +2015,7 @@ fn issuer_transfer_cancel_emits_event() {
 
 #[test]
 fn issuer_transfer_cancel_then_can_propose_again() {
-    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let (env, client, _issuer, token, _payment_token, _contract_id) = claim_setup();
     let new_issuer_1 = Address::generate(&env);
     let new_issuer_2 = Address::generate(&env);
 
@@ -2045,7 +2045,7 @@ fn issuer_transfer_cannot_propose_for_nonexistent_offering() {
 
 #[test]
 fn issuer_transfer_cannot_propose_when_already_pending() {
-    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let (env, client, _issuer, token, _payment_token, _contract_id) = claim_setup();
     let new_issuer_1 = Address::generate(&env);
     let new_issuer_2 = Address::generate(&env);
 
@@ -2058,8 +2058,7 @@ fn issuer_transfer_cannot_propose_when_already_pending() {
 
 #[test]
 fn issuer_transfer_cannot_accept_when_no_pending() {
-    let (env, client, _issuer, token, _payment_token, _contract_id) = claim_setup();
-    let some_address = Address::generate(&env);
+    let (_env, client, _issuer, token, _payment_token, _contract_id) = claim_setup();
 
     let result = client.try_accept_issuer_transfer(&token);
     assert!(result.is_err());
@@ -2067,7 +2066,7 @@ fn issuer_transfer_cannot_accept_when_no_pending() {
 
 #[test]
 fn issuer_transfer_cannot_cancel_when_no_pending() {
-    let (env, client, _issuer, token, _payment_token, _contract_id) = claim_setup();
+    let (_env, client, _issuer, token, _payment_token, _contract_id) = claim_setup();
 
     let result = client.try_cancel_issuer_transfer(&token);
     assert!(result.is_err());
@@ -2079,7 +2078,7 @@ fn issuer_transfer_propose_requires_auth() {
     let env = Env::default();
     let contract_id = env.register_contract(None, RevoraRevenueShare);
     let client = RevoraRevenueShareClient::new(&env, &contract_id);
-    let issuer = Address::generate(&env);
+    let _issuer = Address::generate(&env);
     let token = Address::generate(&env);
     let new_issuer = Address::generate(&env);
 
@@ -2113,7 +2112,7 @@ fn issuer_transfer_cancel_requires_auth() {
 
 #[test]
 fn issuer_transfer_double_accept_fails() {
-    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let (env, client, _issuer, token, _payment_token, _contract_id) = claim_setup();
     let new_issuer = Address::generate(&env);
 
     client.propose_issuer_transfer(&token, &new_issuer);
@@ -2128,9 +2127,9 @@ fn issuer_transfer_double_accept_fails() {
 
 #[test]
 fn issuer_transfer_to_same_address() {
-    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let (_env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
 
-    // Transfer to self
+    // Transfer to self (issuer is used here)
     let result = client.try_propose_issuer_transfer(&token, &issuer);
     assert!(result.is_ok());
 
@@ -2165,7 +2164,7 @@ fn issuer_transfer_multiple_offerings_isolation() {
 
 #[test]
 fn issuer_transfer_blocked_when_frozen() {
-    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let (env, client, _issuer, token, _payment_token, _contract_id) = claim_setup();
     let new_issuer = Address::generate(&env);
     let admin = Address::generate(&env);
 
@@ -2178,7 +2177,7 @@ fn issuer_transfer_blocked_when_frozen() {
 
 #[test]
 fn issuer_transfer_accept_blocked_when_frozen() {
-    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let (env, client, _issuer, token, _payment_token, _contract_id) = claim_setup();
     let new_issuer = Address::generate(&env);
     let admin = Address::generate(&env);
 
@@ -2193,7 +2192,7 @@ fn issuer_transfer_accept_blocked_when_frozen() {
 
 #[test]
 fn issuer_transfer_cancel_blocked_when_frozen() {
-    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let (env, client, _issuer, token, _payment_token, _contract_id) = claim_setup();
     let new_issuer = Address::generate(&env);
     let admin = Address::generate(&env);
 
@@ -2229,7 +2228,7 @@ fn issuer_transfer_preserves_audit_summary() {
 
 #[test]
 fn issuer_transfer_new_issuer_can_report_revenue() {
-    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let (env, client, _issuer, token, _payment_token, _contract_id) = claim_setup();
     let new_issuer = Address::generate(&env);
 
     client.propose_issuer_transfer(&token, &new_issuer);
@@ -2242,7 +2241,7 @@ fn issuer_transfer_new_issuer_can_report_revenue() {
 
 #[test]
 fn issuer_transfer_new_issuer_can_set_concentration_limit() {
-    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let (env, client, _issuer, token, _payment_token, _contract_id) = claim_setup();
     let new_issuer = Address::generate(&env);
 
     client.propose_issuer_transfer(&token, &new_issuer);
@@ -2255,7 +2254,7 @@ fn issuer_transfer_new_issuer_can_set_concentration_limit() {
 
 #[test]
 fn issuer_transfer_new_issuer_can_set_rounding_mode() {
-    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let (env, client, _issuer, token, _payment_token, _contract_id) = claim_setup();
     let new_issuer = Address::generate(&env);
 
     client.propose_issuer_transfer(&token, &new_issuer);
@@ -2268,7 +2267,7 @@ fn issuer_transfer_new_issuer_can_set_rounding_mode() {
 
 #[test]
 fn issuer_transfer_new_issuer_can_set_claim_delay() {
-    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let (env, client, _issuer, token, _payment_token, _contract_id) = claim_setup();
     let new_issuer = Address::generate(&env);
 
     client.propose_issuer_transfer(&token, &new_issuer);
@@ -2300,7 +2299,7 @@ fn issuer_transfer_holders_can_still_claim() {
 
 #[test]
 fn issuer_transfer_then_new_deposits_and_claims_work() {
-    let (env, client, issuer, token, payment_token, _contract_id) = claim_setup();
+    let (env, client, _issuer, token, payment_token, _contract_id) = claim_setup();
     let holder = Address::generate(&env);
     let new_issuer = Address::generate(&env);
 
