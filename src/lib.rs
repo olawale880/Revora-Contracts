@@ -595,14 +595,7 @@ impl RevoraRevenueShare {
         Self::require_not_frozen(&env)?;
         issuer.require_auth();
 
-        Self::do_deposit_revenue(
-            &env,
-            issuer,
-            token,
-            payment_token,
-            amount,
-            period_id,
-        )
+        Self::do_deposit_revenue(&env, issuer, token, payment_token, amount, period_id)
     }
 
     /// Deposit revenue for an offering using a specific snapshot reference.
