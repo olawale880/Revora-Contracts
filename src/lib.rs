@@ -205,9 +205,7 @@ impl RevoraRevenueShare {
 
         // Maintain reverse lookup: token -> issuer
         let issuer_lookup_key = DataKey::OfferingIssuer(token.clone());
-        env.storage()
-            .persistent()
-            .set(&issuer_lookup_key, &issuer);
+        env.storage().persistent().set(&issuer_lookup_key, &issuer);
 
         env.events().publish(
             (symbol_short!("offer_reg"), issuer),
@@ -251,9 +249,9 @@ impl RevoraRevenueShare {
         Self::require_not_frozen(&env)?;
 
         // Verify offering exists and issuer is current
-        let current_issuer = Self::get_current_issuer(&env, &token)
-            .ok_or(RevoraError::OfferingNotFound)?;
-        
+        let current_issuer =
+            Self::get_current_issuer(&env, &token).ok_or(RevoraError::OfferingNotFound)?;
+
         if current_issuer != issuer {
             return Err(RevoraError::OfferingNotFound);
         }
@@ -423,9 +421,9 @@ impl RevoraRevenueShare {
         Self::require_not_frozen(&env)?;
 
         // Verify offering exists and issuer is current
-        let current_issuer = Self::get_current_issuer(&env, &token)
-            .ok_or(RevoraError::LimitReached)?;
-        
+        let current_issuer =
+            Self::get_current_issuer(&env, &token).ok_or(RevoraError::LimitReached)?;
+
         if current_issuer != issuer {
             return Err(RevoraError::LimitReached);
         }
@@ -448,9 +446,9 @@ impl RevoraRevenueShare {
         Self::require_not_frozen(&env)?;
 
         // Verify offering exists and issuer is current
-        let current_issuer = Self::get_current_issuer(&env, &token)
-            .ok_or(RevoraError::OfferingNotFound)?;
-        
+        let current_issuer =
+            Self::get_current_issuer(&env, &token).ok_or(RevoraError::OfferingNotFound)?;
+
         if current_issuer != issuer {
             return Err(RevoraError::OfferingNotFound);
         }
@@ -513,9 +511,9 @@ impl RevoraRevenueShare {
         Self::require_not_frozen(&env)?;
 
         // Verify offering exists and issuer is current
-        let current_issuer = Self::get_current_issuer(&env, &token)
-            .ok_or(RevoraError::LimitReached)?;
-        
+        let current_issuer =
+            Self::get_current_issuer(&env, &token).ok_or(RevoraError::LimitReached)?;
+
         if current_issuer != issuer {
             return Err(RevoraError::LimitReached);
         }
@@ -584,9 +582,9 @@ impl RevoraRevenueShare {
         Self::require_not_frozen(&env)?;
 
         // Verify offering exists and issuer is current
-        let current_issuer = Self::get_current_issuer(&env, &token)
-            .ok_or(RevoraError::OfferingNotFound)?;
-        
+        let current_issuer =
+            Self::get_current_issuer(&env, &token).ok_or(RevoraError::OfferingNotFound)?;
+
         if current_issuer != issuer {
             return Err(RevoraError::OfferingNotFound);
         }
@@ -648,9 +646,9 @@ impl RevoraRevenueShare {
         Self::require_not_frozen(&env)?;
 
         // Verify offering exists and issuer is current
-        let current_issuer = Self::get_current_issuer(&env, &token)
-            .ok_or(RevoraError::OfferingNotFound)?;
-        
+        let current_issuer =
+            Self::get_current_issuer(&env, &token).ok_or(RevoraError::OfferingNotFound)?;
+
         if current_issuer != issuer {
             return Err(RevoraError::OfferingNotFound);
         }
@@ -833,9 +831,9 @@ impl RevoraRevenueShare {
         Self::require_not_frozen(&env)?;
 
         // Verify offering exists and issuer is current
-        let current_issuer = Self::get_current_issuer(&env, &token)
-            .ok_or(RevoraError::OfferingNotFound)?;
-        
+        let current_issuer =
+            Self::get_current_issuer(&env, &token).ok_or(RevoraError::OfferingNotFound)?;
+
         if current_issuer != issuer {
             return Err(RevoraError::OfferingNotFound);
         }
@@ -946,8 +944,8 @@ impl RevoraRevenueShare {
         Self::require_not_frozen(&env)?;
 
         // Get current issuer and verify offering exists
-        let current_issuer = Self::get_current_issuer(&env, &token)
-            .ok_or(RevoraError::OfferingNotFound)?;
+        let current_issuer =
+            Self::get_current_issuer(&env, &token).ok_or(RevoraError::OfferingNotFound)?;
 
         // Only current issuer can propose transfer
         current_issuer.require_auth();
@@ -959,9 +957,7 @@ impl RevoraRevenueShare {
         }
 
         // Store pending transfer
-        env.storage()
-            .persistent()
-            .set(&pending_key, &new_issuer);
+        env.storage().persistent().set(&pending_key, &new_issuer);
 
         env.events().publish(
             (EVENT_ISSUER_TRANSFER_PROPOSED, token.clone()),
@@ -988,8 +984,8 @@ impl RevoraRevenueShare {
         new_issuer.require_auth();
 
         // Get current issuer
-        let old_issuer = Self::get_current_issuer(&env, &token)
-            .ok_or(RevoraError::OfferingNotFound)?;
+        let old_issuer =
+            Self::get_current_issuer(&env, &token).ok_or(RevoraError::OfferingNotFound)?;
 
         // Update the offering's issuer field in storage
         // We need to find and update the offering
@@ -1043,8 +1039,8 @@ impl RevoraRevenueShare {
         Self::require_not_frozen(&env)?;
 
         // Get current issuer
-        let current_issuer = Self::get_current_issuer(&env, &token)
-            .ok_or(RevoraError::OfferingNotFound)?;
+        let current_issuer =
+            Self::get_current_issuer(&env, &token).ok_or(RevoraError::OfferingNotFound)?;
 
         // Only current issuer can cancel
         current_issuer.require_auth();

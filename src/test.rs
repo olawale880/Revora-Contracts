@@ -2021,11 +2021,14 @@ fn issuer_transfer_cancel_then_can_propose_again() {
 
     client.propose_issuer_transfer(&token, &new_issuer_1);
     client.cancel_issuer_transfer(&token);
-    
+
     // Should be able to propose to different address
     let result = client.try_propose_issuer_transfer(&token, &new_issuer_2);
     assert!(result.is_ok());
-    assert_eq!(client.get_pending_issuer_transfer(&token), Some(new_issuer_2));
+    assert_eq!(
+        client.get_pending_issuer_transfer(&token),
+        Some(new_issuer_2)
+    );
 }
 
 // ── Security and abuse prevention tests ──────────────────────
@@ -2047,7 +2050,7 @@ fn issuer_transfer_cannot_propose_when_already_pending() {
     let new_issuer_2 = Address::generate(&env);
 
     client.propose_issuer_transfer(&token, &new_issuer_1);
-    
+
     // Second proposal should fail
     let result = client.try_propose_issuer_transfer(&token, &new_issuer_2);
     assert!(result.is_err());
@@ -2115,7 +2118,7 @@ fn issuer_transfer_double_accept_fails() {
 
     client.propose_issuer_transfer(&token, &new_issuer);
     client.accept_issuer_transfer(&token);
-    
+
     // Second accept should fail (no pending transfer)
     let result = client.try_accept_issuer_transfer(&token);
     assert!(result.is_err());
@@ -2130,7 +2133,7 @@ fn issuer_transfer_to_same_address() {
     // Transfer to self
     let result = client.try_propose_issuer_transfer(&token, &issuer);
     assert!(result.is_ok());
-    
+
     let result = client.try_accept_issuer_transfer(&token);
     assert!(result.is_ok());
 }
@@ -2154,7 +2157,10 @@ fn issuer_transfer_multiple_offerings_isolation() {
 
     // Verify token_a transferred but token_b still pending
     assert_eq!(client.get_pending_issuer_transfer(&token_a), None);
-    assert_eq!(client.get_pending_issuer_transfer(&token_b), Some(new_issuer_b));
+    assert_eq!(
+        client.get_pending_issuer_transfer(&token_b),
+        Some(new_issuer_b)
+    );
 }
 
 #[test]
@@ -2177,7 +2183,7 @@ fn issuer_transfer_accept_blocked_when_frozen() {
     let admin = Address::generate(&env);
 
     client.propose_issuer_transfer(&token, &new_issuer);
-    
+
     client.set_admin(&admin);
     client.freeze();
 
@@ -2192,7 +2198,7 @@ fn issuer_transfer_cancel_blocked_when_frozen() {
     let admin = Address::generate(&env);
 
     client.propose_issuer_transfer(&token, &new_issuer);
-    
+
     client.set_admin(&admin);
     client.freeze();
 
@@ -2340,7 +2346,10 @@ fn issuer_transfer_preserves_revenue_share_bps() {
     client.accept_issuer_transfer(&token);
 
     let offering_after = client.get_offering(&issuer, &token).unwrap();
-    assert_eq!(offering_before.revenue_share_bps, offering_after.revenue_share_bps);
+    assert_eq!(
+        offering_before.revenue_share_bps,
+        offering_after.revenue_share_bps
+    );
 }
 
 #[test]
@@ -2362,7 +2371,7 @@ fn issuer_transfer_new_issuer_can_report_concentration() {
     let new_issuer = Address::generate(&env);
 
     client.set_concentration_limit(&issuer, &token, &6_000, &false);
-    
+
     client.propose_issuer_transfer(&token, &new_issuer);
     client.accept_issuer_transfer(&token);
 
@@ -2370,4 +2379,3 @@ fn issuer_transfer_new_issuer_can_report_concentration() {
     let result = client.try_report_concentration(&new_issuer, &token, &5_000);
     assert!(result.is_ok());
 }
-
