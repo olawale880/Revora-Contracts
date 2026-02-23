@@ -10,15 +10,7 @@ fn make_client(env: &Env) -> RevoraRevenueShareClient<'_> {
     RevoraRevenueShareClient::new(env, &id)
 }
 
-const BOUNDARY_AMOUNTS: [i128; 7] = [
-    i128::MIN,
-    i128::MIN + 1,
-    -1,
-    0,
-    1,
-    i128::MAX - 1,
-    i128::MAX,
-];
+const BOUNDARY_AMOUNTS: [i128; 7] = [i128::MIN, i128::MIN + 1, -1, 0, 1, i128::MAX - 1, i128::MAX];
 const BOUNDARY_PERIODS: [u64; 6] = [0, 1, 2, 10_000, u64::MAX - 1, u64::MAX];
 const FUZZ_ITERATIONS: usize = 128;
 
