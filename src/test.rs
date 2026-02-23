@@ -468,10 +468,7 @@ fn blacklisted_investor_excluded_from_distribution_filter() {
     client.blacklist_add(&admin, &token, &blocked);
 
     let investors = [allowed.clone(), blocked.clone()];
-    let eligible = investors
-        .iter()
-        .filter(|inv| !client.is_blacklisted(&token, inv))
-        .count();
+    let eligible = investors.iter().filter(|inv| !client.is_blacklisted(&token, inv)).count();
 
     assert_eq!(eligible, 1);
 }
@@ -532,11 +529,7 @@ fn register_offering_rejects_bps_over_10000() {
         result.is_err(),
         "contract must return Err(RevoraError::InvalidRevenueShareBps) for bps > 10000"
     );
-    assert_eq!(
-        RevoraError::InvalidRevenueShareBps as u32,
-        1,
-        "error code for integrators"
-    );
+    assert_eq!(RevoraError::InvalidRevenueShareBps as u32, 1, "error code for integrators");
 }
 
 #[test]
@@ -701,10 +694,7 @@ fn report_concentration_emits_warning_when_over_limit() {
     let before = env.events().all().len();
     client.report_concentration(&issuer, &token, &6000);
     assert!(env.events().all().len() > before);
-    assert_eq!(
-        client.get_current_concentration(&issuer, &token),
-        Some(6000)
-    );
+    assert_eq!(client.get_current_concentration(&issuer, &token), Some(6000));
 }
 
 #[test]
@@ -717,10 +707,7 @@ fn report_concentration_no_warning_when_below_limit() {
     client.register_offering(&issuer, &token, &1_000);
     client.set_concentration_limit(&issuer, &token, &5000, &false);
     client.report_concentration(&issuer, &token, &4000);
-    assert_eq!(
-        client.get_current_concentration(&issuer, &token),
-        Some(4000)
-    );
+    assert_eq!(client.get_current_concentration(&issuer, &token), Some(4000));
 }
 
 #[test]
@@ -872,15 +859,9 @@ fn set_and_get_rounding_mode() {
     let issuer = Address::generate(&env);
     let token = Address::generate(&env);
     client.register_offering(&issuer, &token, &1_000);
-    assert_eq!(
-        client.get_rounding_mode(&issuer, &token),
-        RoundingMode::Truncation
-    );
+    assert_eq!(client.get_rounding_mode(&issuer, &token), RoundingMode::Truncation);
     client.set_rounding_mode(&issuer, &token, &RoundingMode::RoundHalfUp);
-    assert_eq!(
-        client.get_rounding_mode(&issuer, &token),
-        RoundingMode::RoundHalfUp
-    );
+    assert_eq!(client.get_rounding_mode(&issuer, &token), RoundingMode::RoundHalfUp);
 }
 
 #[test]
@@ -943,14 +924,7 @@ fn balance(env: &Env, payment_token: &Address, who: &Address) -> i128 {
 }
 
 /// Full setup for claim tests: env, client, issuer, offering token, payment token, contract addr.
-fn claim_setup() -> (
-    Env,
-    RevoraRevenueShareClient<'static>,
-    Address,
-    Address,
-    Address,
-    Address,
-) {
+fn claim_setup() -> (Env, RevoraRevenueShareClient<'static>, Address, Address, Address, Address) {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register_contract(None, RevoraRevenueShare);
@@ -1039,10 +1013,7 @@ fn deposit_revenue_transfers_tokens() {
     let issuer_balance_before = balance(&env, &payment_token, &issuer);
     client.deposit_revenue(&issuer, &token, &payment_token, &100_000, &1);
 
-    assert_eq!(
-        balance(&env, &payment_token, &issuer),
-        issuer_balance_before - 100_000
-    );
+    assert_eq!(balance(&env, &payment_token, &issuer), issuer_balance_before - 100_000);
     assert_eq!(balance(&env, &payment_token, &contract_id), 100_000);
 }
 
