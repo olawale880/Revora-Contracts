@@ -31,6 +31,10 @@ pub enum RevoraError {
     ContractFrozen = 10,
     /// Revenue for this period is not yet claimable (delay not elapsed).
     ClaimDelayNotElapsed = 11,
+    /// Snapshot distribution is not enabled for this offering.
+    SnapshotNotEnabled = 12,
+    /// Provided snapshot reference is outdated or duplicates a previous one.
+    OutdatedSnapshot = 13,
 }
 
 // ── Event symbols ────────────────────────────────────────────
@@ -39,10 +43,12 @@ const EVENT_BL_ADD: Symbol = symbol_short!("bl_add");
 const EVENT_BL_REM: Symbol = symbol_short!("bl_rem");
 const EVENT_CONCENTRATION_WARNING: Symbol = symbol_short!("conc_warn");
 const EVENT_REV_DEPOSIT: Symbol = symbol_short!("rev_dep");
+const EVENT_REV_DEP_SNAP: Symbol = symbol_short!("rev_snap");
 const EVENT_CLAIM: Symbol = symbol_short!("claim");
 const EVENT_SHARE_SET: Symbol = symbol_short!("share_set");
 const EVENT_FREEZE: Symbol = symbol_short!("freeze");
 const EVENT_CLAIM_DELAY_SET: Symbol = symbol_short!("delay_set");
+const EVENT_SNAP_CONFIG: Symbol = symbol_short!("snap_cfg");
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -128,6 +134,10 @@ pub enum DataKey {
     Admin,
     /// Contract frozen flag; when true, state-changing ops are disabled (#32).
     Frozen,
+    /// Per (issuer, token): whether snapshot distribution is enabled.
+    SnapshotConfig(Address, Address),
+    /// Per (issuer, token): latest recorded snapshot reference.
+    LastSnapshotRef(Address, Address),
 }
 
 /// Maximum number of offerings returned in a single page.
@@ -574,6 +584,89 @@ impl RevoraRevenueShare {
             (payment_token, amount, period_id),
         );
         Ok(())
+    }
+
+    /// Deposit revenue for an offering using a specific snapshot reference.
+    ///
+    /// Requires that snapshot distribution is enabled for the offering.
+    /// The `snapshot_reference` (e.g., ledger sequence) must be strictly greater than
+    /// any previously recorded snapshot for this offering to prevent duplication.
+    pub fn deposit_revenue_with_snapshot(
+        env: Env,
+        issuer: Address,
+        token: Address,
+        payment_token: Address,
+        amount: i128,
+        period_id: u64,
+        snapshot_reference: u64,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        issuer.require_auth();
+
+        // 1. Verify snapshots are enabled
+        if !Self::get_snapshot_config(env.clone(), issuer.clone(), token.clone()) {
+            return Err(RevoraError::SnapshotNotEnabled);
+        }
+
+        // 2. Validate snapshot reference (must be strictly monotonic)
+        let snap_key = DataKey::LastSnapshotRef(issuer.clone(), token.clone());
+        let last_snap: u64 = env.storage().persistent().get(&snap_key).unwrap_or(0);
+        if snapshot_reference <= last_snap {
+            return Err(RevoraError::OutdatedSnapshot);
+        }
+
+        // 3. Delegate to core deposit logic
+        Self::deposit_revenue(
+            env.clone(),
+            issuer.clone(),
+            token.clone(),
+            payment_token.clone(),
+            amount,
+            period_id,
+        )?;
+
+        // 4. Update last snapshot and emit specialized event
+        env.storage().persistent().set(&snap_key, &snapshot_reference);
+        env.events().publish(
+            (EVENT_REV_DEP_SNAP, issuer, token),
+            (payment_token, amount, period_id, snapshot_reference),
+        );
+
+        Ok(())
+    }
+
+    /// Enable or disable snapshot-based distribution for an offering.
+    pub fn set_snapshot_config(
+        env: Env,
+        issuer: Address,
+        token: Address,
+        enabled: bool,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        issuer.require_auth();
+
+        if Self::get_offering(env.clone(), issuer.clone(), token.clone()).is_none() {
+            return Err(RevoraError::OfferingNotFound);
+        }
+
+        let key = DataKey::SnapshotConfig(issuer.clone(), token.clone());
+        env.storage().persistent().set(&key, &enabled);
+
+        env.events()
+            .publish((EVENT_SNAP_CONFIG, issuer, token), enabled);
+        Ok(())
+    }
+
+    /// Check if snapshot-based distribution is enabled for an offering.
+    pub fn get_snapshot_config(env: Env, issuer: Address, token: Address) -> bool {
+        let key = DataKey::SnapshotConfig(issuer, token);
+        env.storage().persistent().get(&key).unwrap_or(false)
+    }
+
+    /// Get the latest recorded snapshot reference for an offering.
+    pub fn get_last_snapshot_ref(env: Env, issuer: Address, token: Address) -> u64 {
+        let key = DataKey::LastSnapshotRef(issuer, token);
+        env.storage().persistent().get(&key).unwrap_or(0)
     }
 
     /// Set a holder's revenue share (in basis points) for an offering.

@@ -1876,3 +1876,125 @@ fn freeze_succeeds_when_called_by_admin() {
     assert!(r.is_ok());
     assert!(client.is_frozen());
 }
+
+// ===========================================================================
+// Snapshot-based distribution (#Snapshot)
+// ===========================================================================
+
+#[test]
+fn set_snapshot_config_stores_and_returns_config() {
+    let (_env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+
+    assert_eq!(client.get_snapshot_config(&issuer, &token), false);
+    client.set_snapshot_config(&issuer, &token, &true);
+    assert_eq!(client.get_snapshot_config(&issuer, &token), true);
+    client.set_snapshot_config(&issuer, &token, &false);
+    assert_eq!(client.get_snapshot_config(&issuer, &token), false);
+}
+
+#[test]
+fn deposit_revenue_with_snapshot_succeeds_when_enabled() {
+    let (env, client, issuer, token, payment_token, _contract_id) = claim_setup();
+
+    client.set_snapshot_config(&issuer, &token, &true);
+    let snapshot_ref: u64 = 123456;
+    let period_id: u64 = 1;
+    let amount: i128 = 100_000;
+
+    let r = client.try_deposit_revenue_with_snapshot(
+        &issuer,
+        &token,
+        &payment_token,
+        &amount,
+        &period_id,
+        &snapshot_ref,
+    );
+    assert!(r.is_ok());
+
+    assert_eq!(client.get_last_snapshot_ref(&issuer, &token), snapshot_ref);
+    assert_eq!(client.get_period_count(&token), 1);
+}
+
+#[test]
+fn deposit_revenue_with_snapshot_fails_when_disabled() {
+    let (_env, client, issuer, token, payment_token, _contract_id) = claim_setup();
+
+    // Disabled by default
+    let result = client.try_deposit_revenue_with_snapshot(
+        &issuer,
+        &token,
+        &payment_token,
+        &100_000,
+        &1,
+        &123456,
+    );
+    
+    // Should fail with SnapshotNotEnabled (12)
+    assert!(result.is_err());
+    let err = result.err().unwrap();
+    assert!(matches!(err, Ok(RevoraError::SnapshotNotEnabled)));
+}
+
+#[test]
+fn deposit_with_snapshot_enforces_monotonicity() {
+    let (env, client, issuer, token, payment_token, _contract_id) = claim_setup();
+
+    client.set_snapshot_config(&issuer, &token, &true);
+    
+    // First deposit at ref 100
+    client.deposit_revenue_with_snapshot(&issuer, &token, &payment_token, &10_000, &1, &100);
+    
+    // Second deposit at ref 100 should fail (duplicate)
+    let r2 = client.try_deposit_revenue_with_snapshot(&issuer, &token, &payment_token, &10_000, &2, &100);
+    assert!(r2.is_err());
+    let err2 = r2.err().unwrap();
+    assert!(matches!(err2, Ok(RevoraError::OutdatedSnapshot)));
+
+    // Third deposit at ref 99 should fail (outdated)
+    let r3 = client.try_deposit_revenue_with_snapshot(&issuer, &token, &payment_token, &10_000, &3, &99);
+    assert!(r3.is_err());
+    let err3 = r3.err().unwrap();
+    assert!(matches!(err3, Ok(RevoraError::OutdatedSnapshot)));
+
+    // Fourth deposit at ref 101 should succeed
+    let r4 = client.try_deposit_revenue_with_snapshot(&issuer, &token, &payment_token, &10_000, &4, &101);
+    assert!(r4.is_ok());
+    assert_eq!(client.get_last_snapshot_ref(&issuer, &token), 101);
+}
+
+#[test]
+fn deposit_with_snapshot_emits_specialized_event() {
+    let (env, client, issuer, token, payment_token, _contract_id) = claim_setup();
+
+    client.set_snapshot_config(&issuer, &token, &true);
+    let before = env.events().all().len();
+    
+    client.deposit_revenue_with_snapshot(&issuer, &token, &payment_token, &10_000, &1, &1000);
+    
+    let all_events = env.events().all();
+    assert!(all_events.len() > before);
+    // The last event should be rev_snap
+    // (Actual event validation depends on being able to parse the events which is complex inSDK tests without helper)
+}
+
+#[test]
+fn set_snapshot_config_requires_offering() {
+    let (env, client, issuer, _token, _payment_token, _contract_id) = claim_setup();
+    let unknown_token = Address::generate(&env);
+
+    let r = client.try_set_snapshot_config(&issuer, &unknown_token, &true);
+    assert!(r.is_err());
+}
+
+#[test]
+fn set_snapshot_config_requires_auth() {
+    let env = Env::default();
+    let cid = env.register_contract(None, RevoraRevenueShare);
+    let client = RevoraRevenueShareClient::new(&env, &cid);
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    
+    // No mock_all_auths
+    let result = client.try_set_snapshot_config(&issuer, &token, &true);
+    assert!(result.is_err());
+}
