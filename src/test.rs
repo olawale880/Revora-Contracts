@@ -2095,7 +2095,7 @@ fn multisig_setup() -> (Env, RevoraRevenueShareClient<'static>, Address, Address
 
 #[test]
 fn multisig_init_sets_owners_and_threshold() {
-    let (env, client, owner1, owner2, owner3, _caller) = multisig_setup();
+    let (_env, client, owner1, owner2, owner3, _caller) = multisig_setup();
 
     assert_eq!(client.get_multisig_threshold(), Some(2));
     let owners = client.get_multisig_owners();
