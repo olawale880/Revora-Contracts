@@ -1,7 +1,9 @@
 #![no_std]
+#![deny(unsafe_code)]
+#![deny(clippy::dbg_macro, clippy::todo, clippy::unimplemented)]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Map,
-    Symbol, Vec,
+    String, Symbol, Vec,
 };
 
 /// Centralized contract error codes. Auth failures are signaled by host panic (require_auth).
@@ -31,8 +33,16 @@ pub enum RevoraError {
     ContractFrozen = 10,
     /// Revenue for this period is not yet claimable (delay not elapsed).
     ClaimDelayNotElapsed = 11,
+    /// A transfer is already pending for this offering.
+    IssuerTransferPending = 12,
+    /// No transfer is pending for this offering.
+    NoTransferPending = 13,
+    /// Caller is not authorized to accept this transfer.
+    UnauthorizedTransferAccept = 14,
     /// Payout asset does not match the configured payout asset for this offering.
-    PayoutAssetMismatch = 12,
+    PayoutAssetMismatch = 15,
+    /// Metadata string exceeds maximum allowed length.
+    MetadataTooLarge = 16,
 }
 
 // ── Event symbols ────────────────────────────────────────────
@@ -46,17 +56,31 @@ const EVENT_REVENUE_REPORT_REJECTED: Symbol = symbol_short!("rev_rej");
 const EVENT_REVENUE_REPORT_REJECTED_ASSET: Symbol = symbol_short!("rev_reja");
 const EVENT_BL_ADD: Symbol = symbol_short!("bl_add");
 const EVENT_BL_REM: Symbol = symbol_short!("bl_rem");
+// Versioned event symbols (v1). We emit legacy events for compatibility
+// and also emit explicit v1 events that include a leading `version` field.
+const EVENT_OFFER_REG_V1: Symbol = symbol_short!("ofr_reg1");
+const EVENT_REV_INIT_V1: Symbol = symbol_short!("rv_init1");
+const EVENT_REV_INIA_V1: Symbol = symbol_short!("rv_inia1");
+const EVENT_REV_REP_V1: Symbol = symbol_short!("rv_rep1");
+const EVENT_REV_REPA_V1: Symbol = symbol_short!("rv_repa1");
+
+const EVENT_SCHEMA_VERSION: u32 = 1;
 const EVENT_CONCENTRATION_WARNING: Symbol = symbol_short!("conc_warn");
 const EVENT_REV_DEPOSIT: Symbol = symbol_short!("rev_dep");
 const EVENT_CLAIM: Symbol = symbol_short!("claim");
 const EVENT_SHARE_SET: Symbol = symbol_short!("share_set");
 const EVENT_FREEZE: Symbol = symbol_short!("freeze");
 const EVENT_CLAIM_DELAY_SET: Symbol = symbol_short!("delay_set");
+const EVENT_ISSUER_TRANSFER_PROPOSED: Symbol = symbol_short!("iss_prop");
+const EVENT_ISSUER_TRANSFER_ACCEPTED: Symbol = symbol_short!("iss_acc");
+const EVENT_ISSUER_TRANSFER_CANCELLED: Symbol = symbol_short!("iss_canc");
 const EVENT_TESTNET_MODE: Symbol = symbol_short!("test_mode");
 const EVENT_INIT: Symbol = symbol_short!("init");
 const EVENT_PAUSED: Symbol = symbol_short!("paused");
 const EVENT_UNPAUSED: Symbol = symbol_short!("unpaused");
 const EVENT_DIST_CALC: Symbol = symbol_short!("dist_calc");
+const EVENT_METADATA_SET: Symbol = symbol_short!("meta_set");
+const EVENT_METADATA_UPDATED: Symbol = symbol_short!("meta_upd");
 
 const BPS_DENOMINATOR: i128 = 10_000;
 
@@ -151,16 +175,29 @@ pub enum DataKey {
     Admin,
     /// Contract frozen flag; when true, state-changing ops are disabled (#32).
     Frozen,
+    /// Pending issuer transfer for an offering token: token -> new_issuer.
+    PendingIssuerTransfer(Address),
+    /// Current issuer lookup by offering token: token -> issuer.
+    OfferingIssuer(Address),
     /// Testnet mode flag; when true, enables fee-free/simplified behavior (#24).
     TestnetMode,
     /// Safety role address for emergency pause (#7).
     Safety,
     /// Global pause flag; when true, state-mutating ops are disabled (#7).
     Paused,
+    /// Feature flag: emit versioned events when present (v1 schema).
+    EventVersioningEnabled,
+    /// Per (issuer, token): metadata reference (IPFS hash, HTTPS URI, etc.)
+    OfferingMetadata(Address, Address),
+    /// Platform fee in basis points (max 5000 = 50%) taken from reported revenue (#6).
+    PlatformFeeBps,
 }
 
 /// Maximum number of offerings returned in a single page.
 const MAX_PAGE_LIMIT: u32 = 20;
+
+/// Maximum platform fee in basis points (50%).
+const MAX_PLATFORM_FEE_BPS: u32 = 5_000;
 
 /// Maximum number of periods that can be claimed in a single transaction.
 /// Keeps compute costs predictable within Soroban limits.
@@ -172,6 +209,14 @@ pub struct RevoraRevenueShare;
 
 #[contractimpl]
 impl RevoraRevenueShare {
+    fn is_event_versioning_enabled(env: Env) -> bool {
+        let key = DataKey::EventVersioningEnabled;
+        env.storage()
+            .persistent()
+            .get::<DataKey, bool>(&key)
+            .unwrap_or(false)
+    }
+
     /// Returns error if contract is frozen (#32). Call at start of state-mutating entrypoints.
     fn require_not_frozen(env: &Env) -> Result<(), RevoraError> {
         let key = DataKey::Frozen;
@@ -184,6 +229,12 @@ impl RevoraRevenueShare {
             return Err(RevoraError::ContractFrozen);
         }
         Ok(())
+    }
+
+    /// Get the current issuer for an offering token (used for auth checks after transfers).
+    fn get_current_issuer(env: &Env, token: &Address) -> Option<Address> {
+        let key = DataKey::OfferingIssuer(token.clone());
+        env.storage().persistent().get(&key)
     }
 
     /// Initialize admin and optional safety role for emergency pause (#7).
@@ -317,10 +368,26 @@ impl RevoraRevenueShare {
         env.storage().persistent().set(&item_key, &offering);
         env.storage().persistent().set(&count_key, &(count + 1));
 
+        // Maintain reverse lookup: token -> issuer
+        let issuer_lookup_key = DataKey::OfferingIssuer(token.clone());
+        env.storage().persistent().set(&issuer_lookup_key, &issuer);
+
         env.events().publish(
-            (symbol_short!("offer_reg"), issuer),
-            (token, revenue_share_bps, payout_asset),
+            (symbol_short!("offer_reg"), issuer.clone()),
+            (token.clone(), revenue_share_bps, payout_asset.clone()),
         );
+        // Optionally emit a versioned v1 event with explicit version field
+        if Self::is_event_versioning_enabled(env.clone()) {
+            env.events().publish(
+                (EVENT_OFFER_REG_V1, issuer.clone()),
+                (
+                    EVENT_SCHEMA_VERSION,
+                    token.clone(),
+                    revenue_share_bps,
+                    payout_asset.clone(),
+                ),
+            );
+        }
         Ok(())
     }
 
@@ -364,6 +431,15 @@ impl RevoraRevenueShare {
         override_existing: bool,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
+
+        // Verify offering exists and issuer is current
+        let current_issuer =
+            Self::get_current_issuer(&env, &token).ok_or(RevoraError::OfferingNotFound)?;
+
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
+
         Self::require_not_paused(&env);
         issuer.require_auth();
 
@@ -481,7 +557,7 @@ impl RevoraRevenueShare {
         }
         env.events().publish(
             (EVENT_REVENUE_REPORTED, issuer.clone(), token.clone()),
-            (amount, period_id, blacklist),
+            (amount, period_id, blacklist.clone()),
         );
 
         env.events().publish(
@@ -489,10 +565,43 @@ impl RevoraRevenueShare {
                 EVENT_REVENUE_REPORTED_ASSET,
                 issuer.clone(),
                 token.clone(),
-                payout_asset,
+                payout_asset.clone(),
             ),
             (amount, period_id),
         );
+
+        // Optionally emit versioned v1 events for forward-compatible consumers
+        if Self::is_event_versioning_enabled(env.clone()) {
+            env.events().publish(
+                (EVENT_REV_INIT_V1, issuer.clone(), token.clone()),
+                (EVENT_SCHEMA_VERSION, amount, period_id, blacklist.clone()),
+            );
+
+            env.events().publish(
+                (
+                    EVENT_REV_INIA_V1,
+                    issuer.clone(),
+                    token.clone(),
+                    payout_asset.clone(),
+                ),
+                (EVENT_SCHEMA_VERSION, amount, period_id, blacklist.clone()),
+            );
+
+            env.events().publish(
+                (EVENT_REV_REP_V1, issuer.clone(), token.clone()),
+                (EVENT_SCHEMA_VERSION, amount, period_id, blacklist.clone()),
+            );
+
+            env.events().publish(
+                (
+                    EVENT_REV_REPA_V1,
+                    issuer.clone(),
+                    token.clone(),
+                    payout_asset.clone(),
+                ),
+                (EVENT_SCHEMA_VERSION, amount, period_id),
+            );
+        }
 
         // Audit log summary (#34): maintain per-offering total revenue and report count
         let summary_key = DataKey::AuditSummary(issuer.clone(), token.clone());
@@ -646,10 +755,16 @@ impl RevoraRevenueShare {
         enforce: bool,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
-        issuer.require_auth();
-        if Self::get_offering(env.clone(), issuer.clone(), token.clone()).is_none() {
-            return Err(RevoraError::LimitReached); // reuse: "offering not found" semantics
+
+        // Verify offering exists and issuer is current
+        let current_issuer =
+            Self::get_current_issuer(&env, &token).ok_or(RevoraError::LimitReached)?;
+
+        if current_issuer != issuer {
+            return Err(RevoraError::LimitReached);
         }
+
+        issuer.require_auth();
         let key = DataKey::ConcentrationLimit(issuer, token);
         env.storage()
             .persistent()
@@ -665,6 +780,15 @@ impl RevoraRevenueShare {
         concentration_bps: u32,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
+
+        // Verify offering exists and issuer is current
+        let current_issuer =
+            Self::get_current_issuer(&env, &token).ok_or(RevoraError::OfferingNotFound)?;
+
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
+
         issuer.require_auth();
         let curr_key = DataKey::CurrentConcentration(issuer.clone(), token.clone());
         env.storage()
@@ -721,10 +845,16 @@ impl RevoraRevenueShare {
         mode: RoundingMode,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
-        issuer.require_auth();
-        if Self::get_offering(env.clone(), issuer.clone(), token.clone()).is_none() {
+
+        // Verify offering exists and issuer is current
+        let current_issuer =
+            Self::get_current_issuer(&env, &token).ok_or(RevoraError::LimitReached)?;
+
+        if current_issuer != issuer {
             return Err(RevoraError::LimitReached);
         }
+
+        issuer.require_auth();
         let key = DataKey::RoundingMode(issuer, token);
         env.storage().persistent().set(&key, &mode);
         Ok(())
@@ -786,7 +916,14 @@ impl RevoraRevenueShare {
         period_id: u64,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
-        issuer.require_auth();
+
+        // Verify offering exists and issuer is current
+        let current_issuer =
+            Self::get_current_issuer(&env, &token).ok_or(RevoraError::OfferingNotFound)?;
+
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
 
         // Verify offering exists
         let offering = Self::get_offering(env.clone(), issuer.clone(), token.clone())
@@ -794,6 +931,8 @@ impl RevoraRevenueShare {
         if offering.payout_asset != payment_token {
             return Err(RevoraError::PayoutAssetMismatch);
         }
+
+        issuer.require_auth();
 
         // Check period not already deposited
         let rev_key = DataKey::PeriodRevenue(token.clone(), period_id);
@@ -848,11 +987,16 @@ impl RevoraRevenueShare {
         share_bps: u32,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
-        issuer.require_auth();
 
-        if Self::get_offering(env.clone(), issuer.clone(), token.clone()).is_none() {
+        // Verify offering exists and issuer is current
+        let current_issuer =
+            Self::get_current_issuer(&env, &token).ok_or(RevoraError::OfferingNotFound)?;
+
+        if current_issuer != issuer {
             return Err(RevoraError::OfferingNotFound);
         }
+
+        issuer.require_auth();
 
         if share_bps > 10_000 {
             return Err(RevoraError::InvalidShareBps);
@@ -1028,10 +1172,16 @@ impl RevoraRevenueShare {
         delay_secs: u64,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
-        issuer.require_auth();
-        if Self::get_offering(env.clone(), issuer.clone(), token.clone()).is_none() {
+
+        // Verify offering exists and issuer is current
+        let current_issuer =
+            Self::get_current_issuer(&env, &token).ok_or(RevoraError::OfferingNotFound)?;
+
+        if current_issuer != issuer {
             return Err(RevoraError::OfferingNotFound);
         }
+
+        issuer.require_auth();
         let key = DataKey::ClaimDelaySecs(token.clone());
         env.storage().persistent().set(&key, &delay_secs);
         env.events()
@@ -1125,6 +1275,176 @@ impl RevoraRevenueShare {
             .unwrap_or(false)
     }
 
+    // ── Secure issuer transfer (two-step flow) ─────────────────
+
+    /// Propose transferring issuer control of an offering to a new address.
+    /// Only the current issuer may call this. Initiates a two-step transfer.
+    pub fn propose_issuer_transfer(
+        env: Env,
+        token: Address,
+        new_issuer: Address,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+
+        // Get current issuer and verify offering exists
+        let current_issuer =
+            Self::get_current_issuer(&env, &token).ok_or(RevoraError::OfferingNotFound)?;
+
+        // Only current issuer can propose transfer
+        current_issuer.require_auth();
+
+        // Check if transfer already pending
+        let pending_key = DataKey::PendingIssuerTransfer(token.clone());
+        if env.storage().persistent().has(&pending_key) {
+            return Err(RevoraError::IssuerTransferPending);
+        }
+
+        // Store pending transfer
+        env.storage().persistent().set(&pending_key, &new_issuer);
+
+        env.events().publish(
+            (EVENT_ISSUER_TRANSFER_PROPOSED, token.clone()),
+            (current_issuer, new_issuer),
+        );
+
+        Ok(())
+    }
+
+    /// Accept a pending issuer transfer. Only the proposed new issuer may call this.
+    /// Completes the two-step transfer and grants full issuer control to the new address.
+    pub fn accept_issuer_transfer(env: Env, token: Address) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+
+        // Get pending transfer
+        let pending_key = DataKey::PendingIssuerTransfer(token.clone());
+        let new_issuer: Address = env
+            .storage()
+            .persistent()
+            .get(&pending_key)
+            .ok_or(RevoraError::NoTransferPending)?;
+
+        // Only the proposed new issuer can accept
+        new_issuer.require_auth();
+
+        // Get current issuer
+        let old_issuer =
+            Self::get_current_issuer(&env, &token).ok_or(RevoraError::OfferingNotFound)?;
+
+        // Update the offering's issuer field in storage
+        // We need to find and update the offering
+        let offering = Self::get_offering(env.clone(), old_issuer.clone(), token.clone())
+            .ok_or(RevoraError::OfferingNotFound)?;
+
+        // Find the index of this offering
+        let count = Self::get_offering_count(env.clone(), old_issuer.clone());
+        let mut found_index: Option<u32> = None;
+        for i in 0..count {
+            let item_key = DataKey::OfferItem(old_issuer.clone(), i);
+            let stored_offering: Offering = env.storage().persistent().get(&item_key).unwrap();
+            if stored_offering.token == token {
+                found_index = Some(i);
+                break;
+            }
+        }
+
+        let index = found_index.ok_or(RevoraError::OfferingNotFound)?;
+
+        // Update the offering with new issuer
+        let updated_offering = Offering {
+            issuer: new_issuer.clone(),
+            token: token.clone(),
+            revenue_share_bps: offering.revenue_share_bps,
+            payout_asset: offering.payout_asset,
+        };
+
+        // Remove from old issuer's storage
+        let old_item_key = DataKey::OfferItem(old_issuer.clone(), index);
+        env.storage().persistent().remove(&old_item_key);
+
+        // If this wasn't the last offering, move the last offering to fill the gap
+        let old_count = Self::get_offering_count(env.clone(), old_issuer.clone());
+        if index < old_count - 1 {
+            // Move the last offering to the removed index
+            let last_key = DataKey::OfferItem(old_issuer.clone(), old_count - 1);
+            let last_offering: Offering = env.storage().persistent().get(&last_key).unwrap();
+            env.storage()
+                .persistent()
+                .set(&old_item_key, &last_offering);
+            env.storage().persistent().remove(&last_key);
+        }
+
+        // Decrement old issuer's count
+        let old_count_key = DataKey::OfferCount(old_issuer.clone());
+        env.storage()
+            .persistent()
+            .set(&old_count_key, &(old_count - 1));
+
+        // Add to new issuer's storage
+        let new_count = Self::get_offering_count(env.clone(), new_issuer.clone());
+        let new_item_key = DataKey::OfferItem(new_issuer.clone(), new_count);
+        env.storage()
+            .persistent()
+            .set(&new_item_key, &updated_offering);
+
+        // Increment new issuer's count
+        let new_count_key = DataKey::OfferCount(new_issuer.clone());
+        env.storage()
+            .persistent()
+            .set(&new_count_key, &(new_count + 1));
+
+        // Update reverse lookup
+        let issuer_lookup_key = DataKey::OfferingIssuer(token.clone());
+        env.storage()
+            .persistent()
+            .set(&issuer_lookup_key, &new_issuer);
+
+        // Clear pending transfer
+        env.storage().persistent().remove(&pending_key);
+
+        env.events().publish(
+            (EVENT_ISSUER_TRANSFER_ACCEPTED, token),
+            (old_issuer, new_issuer),
+        );
+
+        Ok(())
+    }
+
+    /// Cancel a pending issuer transfer. Only the current issuer may call this.
+    pub fn cancel_issuer_transfer(env: Env, token: Address) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+
+        // Get current issuer
+        let current_issuer =
+            Self::get_current_issuer(&env, &token).ok_or(RevoraError::OfferingNotFound)?;
+
+        // Only current issuer can cancel
+        current_issuer.require_auth();
+
+        // Check if transfer is pending
+        let pending_key = DataKey::PendingIssuerTransfer(token.clone());
+        let proposed_new_issuer: Address = env
+            .storage()
+            .persistent()
+            .get(&pending_key)
+            .ok_or(RevoraError::NoTransferPending)?;
+
+        // Clear pending transfer
+        env.storage().persistent().remove(&pending_key);
+
+        env.events().publish(
+            (EVENT_ISSUER_TRANSFER_CANCELLED, token),
+            (current_issuer, proposed_new_issuer),
+        );
+
+        Ok(())
+    }
+
+    /// Get the pending issuer transfer for an offering, if any.
+    pub fn get_pending_issuer_transfer(env: Env, token: Address) -> Option<Address> {
+        let pending_key = DataKey::PendingIssuerTransfer(token);
+        env.storage().persistent().get(&pending_key)
+    }
+
     // ── Revenue distribution calculation ───────────────────────────
 
     /// Calculate the distribution amount for a token holder.
@@ -1138,6 +1458,8 @@ impl RevoraRevenueShare {
     ///
     /// Rounding: Uses integer division which rounds down (floor).
     /// This is conservative and ensures the contract never over-distributes.
+    // This entrypoint shape is part of the public contract interface and mirrors
+    // off-chain inputs directly, so we allow this specific arity.
     #[allow(clippy::too_many_arguments)]
     pub fn calculate_distribution(
         env: Env,
@@ -1220,6 +1542,75 @@ impl RevoraRevenueShare {
             .expect("division overflow")
     }
 
+    // ── Per-offering metadata storage (#8) ─────────────────────
+
+    /// Maximum allowed length for metadata strings (256 bytes).
+    /// Supports IPFS CIDs (46 chars), URLs, and content hashes.
+    const MAX_METADATA_LENGTH: usize = 256;
+
+    /// Set or update metadata reference for an offering.
+    ///
+    /// Only callable by the current issuer of the offering.
+    /// Metadata can be an IPFS hash (e.g., "Qm..."), HTTPS URI, or any reference string.
+    /// Maximum length: 256 bytes.
+    ///
+    /// Emits `EVENT_METADATA_SET` on first set, `EVENT_METADATA_UPDATED` on subsequent updates.
+    ///
+    /// # Errors
+    /// - `OfferingNotFound`: offering doesn't exist or caller is not the current issuer
+    /// - `MetadataTooLarge`: metadata string exceeds MAX_METADATA_LENGTH
+    /// - `ContractFrozen`: contract is frozen
+    pub fn set_offering_metadata(
+        env: Env,
+        issuer: Address,
+        token: Address,
+        metadata: String,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        Self::require_not_paused(&env);
+
+        // Verify offering exists and issuer is current
+        let current_issuer =
+            Self::get_current_issuer(&env, &token).ok_or(RevoraError::OfferingNotFound)?;
+
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
+
+        issuer.require_auth();
+
+        // Validate metadata length
+        let metadata_bytes = metadata.len();
+        if metadata_bytes > Self::MAX_METADATA_LENGTH as u32 {
+            return Err(RevoraError::MetadataTooLarge);
+        }
+
+        let key = DataKey::OfferingMetadata(issuer.clone(), token.clone());
+        let is_update = env.storage().persistent().has(&key);
+
+        // Store metadata
+        env.storage().persistent().set(&key, &metadata);
+
+        // Emit appropriate event
+        if is_update {
+            env.events()
+                .publish((EVENT_METADATA_UPDATED, issuer, token), metadata);
+        } else {
+            env.events()
+                .publish((EVENT_METADATA_SET, issuer, token), metadata);
+        }
+
+        Ok(())
+    }
+
+    /// Retrieve metadata reference for an offering.
+    ///
+    /// Returns `None` if no metadata has been set for this offering.
+    pub fn get_offering_metadata(env: Env, issuer: Address, token: Address) -> Option<String> {
+        let key = DataKey::OfferingMetadata(issuer, token);
+        env.storage().persistent().get(&key)
+    }
+
     // ── Testnet mode configuration (#24) ───────────────────────
 
     /// Enable or disable testnet mode. Only admin may call.
@@ -1245,6 +1636,42 @@ impl RevoraRevenueShare {
             .persistent()
             .get::<DataKey, bool>(&DataKey::TestnetMode)
             .unwrap_or(false)
+    }
+
+    // ── Platform fee configuration (#6) ────────────────────────
+
+    /// Set the platform fee in basis points.  Admin-only.
+    /// Maximum value is 5 000 bps (50 %).  Pass 0 to disable.
+    pub fn set_platform_fee(env: Env, fee_bps: u32) -> Result<(), RevoraError> {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .ok_or(RevoraError::LimitReached)?;
+        admin.require_auth();
+
+        if fee_bps > MAX_PLATFORM_FEE_BPS {
+            return Err(RevoraError::LimitReached);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::PlatformFeeBps, &fee_bps);
+        Ok(())
+    }
+
+    /// Return the current platform fee in basis points (default 0).
+    pub fn get_platform_fee(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PlatformFeeBps)
+            .unwrap_or(0)
+    }
+
+    /// Calculate the platform fee for a given amount.
+    pub fn calculate_platform_fee(env: Env, amount: i128) -> i128 {
+        let fee_bps = Self::get_platform_fee(env) as i128;
+        (amount * fee_bps).checked_div(BPS_DENOMINATOR).unwrap_or(0)
     }
 }
 
