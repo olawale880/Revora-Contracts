@@ -1,7 +1,8 @@
 #![cfg(test)]
 use soroban_sdk::{
-    testutils::Address as _, testutils::Events as _, testutils::Ledger as _, token, Address, Env,
-    Vec,
+    symbol_short,
+    testutils::{Address as _, Events as _, Ledger as _},
+    token, vec, Address, Env, IntoVal, Vec,
 };
 
 use crate::{RevoraError, RevoraRevenueShare, RevoraRevenueShareClient, RoundingMode};
@@ -18,7 +19,6 @@ const BOUNDARY_PERIODS: [u64; 6] = [0, 1, 2, 10_000, u64::MAX - 1, u64::MAX];
 const FUZZ_ITERATIONS: usize = 128;
 
 fn next_u64(seed: &mut u64) -> u64 {
-    // Deterministic LCG for repeatable pseudo-random test values.
     *seed = seed
         .wrapping_mul(6_364_136_223_846_793_005)
         .wrapping_add(1_442_695_040_888_963_407);
@@ -33,6 +33,578 @@ fn next_amount(seed: &mut u64) -> i128 {
 
 fn next_period(seed: &mut u64) -> u64 {
     next_u64(seed)
+}
+
+// ─── Event-to-flow mapping ───────────────────────────────────────────────────
+//
+//  Flow: Offering Registration  (register_offering)
+//    topic[0] = Symbol("offer_reg")
+//    topic[1] = Address  (issuer)
+//    data     = (Address (token), u32 (revenue_share_bps))
+//
+//  Flow: Revenue Report  (report_revenue)
+//    topic[0] = Symbol("rev_rep")
+//    topic[1] = Address  (issuer)
+//    topic[2] = Address  (token)
+//    data     = (i128 (amount), u64 (period_id), Vec<Address> (blacklist))
+//
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Single-event structure tests ─────────────────────────────────────────────
+
+#[test]
+fn register_offering_emits_exact_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, RevoraRevenueShare);
+    let client = RevoraRevenueShareClient::new(&env, &contract_id);
+
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    let bps: u32 = 1_500;
+
+    client.register_offering(&issuer, &token, &bps);
+
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                contract_id.clone(),
+                (symbol_short!("offer_reg"), issuer.clone()).into_val(&env),
+                (token.clone(), bps).into_val(&env),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn report_revenue_emits_exact_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, RevoraRevenueShare);
+    let client = RevoraRevenueShareClient::new(&env, &contract_id);
+
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    let amount: i128 = 5_000_000;
+    let period_id: u64 = 42;
+
+    client.report_revenue(&issuer, &token, &amount, &period_id, &false);
+
+    let empty_bl = Vec::<Address>::new(&env);
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                contract_id.clone(),
+                (symbol_short!("rev_init"), issuer.clone(), token.clone()).into_val(&env),
+                (amount, period_id, empty_bl.clone()).into_val(&env),
+            ),
+            (
+                contract_id.clone(),
+                (symbol_short!("rev_rep"), issuer.clone(), token.clone()).into_val(&env),
+                (amount, period_id, empty_bl).into_val(&env),
+            ),
+        ]
+    );
+}
+
+// ── Ordering tests ───────────────────────────────────────────────────────────
+
+#[test]
+fn combined_flow_preserves_event_order() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, RevoraRevenueShare);
+    let client = RevoraRevenueShareClient::new(&env, &contract_id);
+
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    let bps: u32 = 1_000;
+    let amount: i128 = 1_000_000;
+    let period_id: u64 = 1;
+
+    client.register_offering(&issuer, &token, &bps);
+    client.report_revenue(&issuer, &token, &amount, &period_id, &false);
+
+    let events = env.events().all();
+    assert_eq!(events.len(), 3);
+
+    let empty_bl = Vec::<Address>::new(&env);
+    assert_eq!(
+        events,
+        vec![
+            &env,
+            (
+                contract_id.clone(),
+                (symbol_short!("offer_reg"), issuer.clone()).into_val(&env),
+                (token.clone(), bps).into_val(&env),
+            ),
+            (
+                contract_id.clone(),
+                (symbol_short!("rev_init"), issuer.clone(), token.clone()).into_val(&env),
+                (amount, period_id, empty_bl.clone()).into_val(&env),
+            ),
+            (
+                contract_id.clone(),
+                (symbol_short!("rev_rep"), issuer.clone(), token.clone()).into_val(&env),
+                (amount, period_id, empty_bl).into_val(&env),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn complex_mixed_flow_events_in_order() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, RevoraRevenueShare);
+    let client = RevoraRevenueShareClient::new(&env, &contract_id);
+
+    let issuer_a = Address::generate(&env);
+    let issuer_b = Address::generate(&env);
+    let token_x = Address::generate(&env);
+    let token_y = Address::generate(&env);
+
+    // Interleave: register A, register B, report A, report B
+    client.register_offering(&issuer_a, &token_x, &500);
+    client.register_offering(&issuer_b, &token_y, &750);
+    client.report_revenue(&issuer_a, &token_x, &100_000, &1, &false);
+    client.report_revenue(&issuer_b, &token_y, &200_000, &1, &false);
+
+    let events = env.events().all();
+    assert_eq!(events.len(), 6);
+
+    let empty_bl = Vec::<Address>::new(&env);
+    assert_eq!(
+        events,
+        vec![
+            &env,
+            (
+                contract_id.clone(),
+                (symbol_short!("offer_reg"), issuer_a.clone()).into_val(&env),
+                (token_x.clone(), 500u32).into_val(&env),
+            ),
+            (
+                contract_id.clone(),
+                (symbol_short!("offer_reg"), issuer_b.clone()).into_val(&env),
+                (token_y.clone(), 750u32).into_val(&env),
+            ),
+            (
+                contract_id.clone(),
+                (symbol_short!("rev_init"), issuer_a.clone(), token_x.clone()).into_val(&env),
+                (100_000i128, 1u64, empty_bl.clone()).into_val(&env),
+            ),
+            (
+                contract_id.clone(),
+                (symbol_short!("rev_rep"), issuer_a.clone(), token_x.clone()).into_val(&env),
+                (100_000i128, 1u64, empty_bl.clone()).into_val(&env),
+            ),
+            (
+                contract_id.clone(),
+                (symbol_short!("rev_init"), issuer_b.clone(), token_y.clone()).into_val(&env),
+                (200_000i128, 1u64, empty_bl.clone()).into_val(&env),
+            ),
+            (
+                contract_id.clone(),
+                (symbol_short!("rev_rep"), issuer_b.clone(), token_y.clone()).into_val(&env),
+                (200_000i128, 1u64, empty_bl).into_val(&env),
+            ),
+        ]
+    );
+}
+
+// ── Multi-entity tests ───────────────────────────────────────────────────────
+
+#[test]
+fn multiple_offerings_emit_distinct_events() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, RevoraRevenueShare);
+    let client = RevoraRevenueShareClient::new(&env, &contract_id);
+
+    let issuer = Address::generate(&env);
+    let token_a = Address::generate(&env);
+    let token_b = Address::generate(&env);
+    let token_c = Address::generate(&env);
+
+    client.register_offering(&issuer, &token_a, &100);
+    client.register_offering(&issuer, &token_b, &200);
+    client.register_offering(&issuer, &token_c, &300);
+
+    let events = env.events().all();
+    assert_eq!(events.len(), 3);
+
+    assert_eq!(
+        events,
+        vec![
+            &env,
+            (
+                contract_id.clone(),
+                (symbol_short!("offer_reg"), issuer.clone()).into_val(&env),
+                (token_a.clone(), 100u32).into_val(&env),
+            ),
+            (
+                contract_id.clone(),
+                (symbol_short!("offer_reg"), issuer.clone()).into_val(&env),
+                (token_b.clone(), 200u32).into_val(&env),
+            ),
+            (
+                contract_id.clone(),
+                (symbol_short!("offer_reg"), issuer.clone()).into_val(&env),
+                (token_c.clone(), 300u32).into_val(&env),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn multiple_revenue_reports_same_offering() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, RevoraRevenueShare);
+    let client = RevoraRevenueShareClient::new(&env, &contract_id);
+
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    client.report_revenue(&issuer, &token, &10_000, &1, &false);
+    client.report_revenue(&issuer, &token, &20_000, &2, &false);
+    client.report_revenue(&issuer, &token, &30_000, &3, &false);
+
+    let events = env.events().all();
+    assert_eq!(events.len(), 6);
+
+    let empty_bl = Vec::<Address>::new(&env);
+    assert_eq!(
+        events,
+        vec![
+            &env,
+            (
+                contract_id.clone(),
+                (symbol_short!("rev_init"), issuer.clone(), token.clone()).into_val(&env),
+                (10_000i128, 1u64, empty_bl.clone()).into_val(&env),
+            ),
+            (
+                contract_id.clone(),
+                (symbol_short!("rev_rep"), issuer.clone(), token.clone()).into_val(&env),
+                (10_000i128, 1u64, empty_bl.clone()).into_val(&env),
+            ),
+            (
+                contract_id.clone(),
+                (symbol_short!("rev_init"), issuer.clone(), token.clone()).into_val(&env),
+                (20_000i128, 2u64, empty_bl.clone()).into_val(&env),
+            ),
+            (
+                contract_id.clone(),
+                (symbol_short!("rev_rep"), issuer.clone(), token.clone()).into_val(&env),
+                (20_000i128, 2u64, empty_bl.clone()).into_val(&env),
+            ),
+            (
+                contract_id.clone(),
+                (symbol_short!("rev_init"), issuer.clone(), token.clone()).into_val(&env),
+                (30_000i128, 3u64, empty_bl.clone()).into_val(&env),
+            ),
+            (
+                contract_id.clone(),
+                (symbol_short!("rev_rep"), issuer.clone(), token.clone()).into_val(&env),
+                (30_000i128, 3u64, empty_bl).into_val(&env),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn same_issuer_different_tokens() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, RevoraRevenueShare);
+    let client = RevoraRevenueShareClient::new(&env, &contract_id);
+
+    let issuer = Address::generate(&env);
+    let token_x = Address::generate(&env);
+    let token_y = Address::generate(&env);
+
+    client.register_offering(&issuer, &token_x, &1_000);
+    client.register_offering(&issuer, &token_y, &2_000);
+    client.report_revenue(&issuer, &token_x, &500_000, &1, &false);
+    client.report_revenue(&issuer, &token_y, &750_000, &1, &false);
+
+    let events = env.events().all();
+    assert_eq!(events.len(), 6);
+
+    let empty_bl = Vec::<Address>::new(&env);
+    assert_eq!(
+        events,
+        vec![
+            &env,
+            (
+                contract_id.clone(),
+                (symbol_short!("offer_reg"), issuer.clone()).into_val(&env),
+                (token_x.clone(), 1_000u32).into_val(&env),
+            ),
+            (
+                contract_id.clone(),
+                (symbol_short!("offer_reg"), issuer.clone()).into_val(&env),
+                (token_y.clone(), 2_000u32).into_val(&env),
+            ),
+            (
+                contract_id.clone(),
+                (symbol_short!("rev_init"), issuer.clone(), token_x.clone()).into_val(&env),
+                (500_000i128, 1u64, empty_bl.clone()).into_val(&env),
+            ),
+            (
+                contract_id.clone(),
+                (symbol_short!("rev_rep"), issuer.clone(), token_x.clone()).into_val(&env),
+                (500_000i128, 1u64, empty_bl.clone()).into_val(&env),
+            ),
+            (
+                contract_id.clone(),
+                (symbol_short!("rev_init"), issuer.clone(), token_y.clone()).into_val(&env),
+                (750_000i128, 1u64, empty_bl.clone()).into_val(&env),
+            ),
+            (
+                contract_id.clone(),
+                (symbol_short!("rev_rep"), issuer.clone(), token_y.clone()).into_val(&env),
+                (750_000i128, 1u64, empty_bl).into_val(&env),
+            ),
+        ]
+    );
+}
+
+// ── Topic / symbol inspection tests ──────────────────────────────────────────
+
+#[test]
+fn topic_symbols_are_distinct() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, RevoraRevenueShare);
+    let client = RevoraRevenueShareClient::new(&env, &contract_id);
+
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    client.register_offering(&issuer, &token, &1_000);
+    client.report_revenue(&issuer, &token, &1_000_000, &1, &false);
+
+    let empty_bl = Vec::<Address>::new(&env);
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                contract_id.clone(),
+                (symbol_short!("offer_reg"), issuer.clone()).into_val(&env),
+                (token.clone(), 1_000u32).into_val(&env),
+            ),
+            (
+                contract_id.clone(),
+                (symbol_short!("rev_init"), issuer.clone(), token.clone()).into_val(&env),
+                (1_000_000i128, 1u64, empty_bl.clone()).into_val(&env),
+            ),
+            (
+                contract_id.clone(),
+                (symbol_short!("rev_rep"), issuer.clone(), token.clone()).into_val(&env),
+                (1_000_000i128, 1u64, empty_bl).into_val(&env),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn rev_rep_topics_include_token_address() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, RevoraRevenueShare);
+    let client = RevoraRevenueShareClient::new(&env, &contract_id);
+
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    client.report_revenue(&issuer, &token, &999, &7, &false);
+
+    let empty_bl = Vec::<Address>::new(&env);
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                contract_id.clone(),
+                (symbol_short!("rev_init"), issuer.clone(), token.clone()).into_val(&env),
+                (999i128, 7u64, empty_bl.clone()).into_val(&env),
+            ),
+            (
+                contract_id.clone(),
+                (symbol_short!("rev_rep"), issuer.clone(), token.clone()).into_val(&env),
+                (999i128, 7u64, empty_bl).into_val(&env),
+            ),
+        ]
+    );
+}
+
+// ── Boundary / edge-case tests ───────────────────────────────────────────────
+
+#[test]
+fn zero_bps_offering() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, RevoraRevenueShare);
+    let client = RevoraRevenueShareClient::new(&env, &contract_id);
+
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    client.register_offering(&issuer, &token, &0);
+
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                contract_id.clone(),
+                (symbol_short!("offer_reg"), issuer.clone()).into_val(&env),
+                (token.clone(), 0u32).into_val(&env),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn max_bps_offering() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, RevoraRevenueShare);
+    let client = RevoraRevenueShareClient::new(&env, &contract_id);
+
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // 10_000 bps == 100%
+    client.register_offering(&issuer, &token, &10_000);
+
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                contract_id.clone(),
+                (symbol_short!("offer_reg"), issuer.clone()).into_val(&env),
+                (token.clone(), 10_000u32).into_val(&env),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn zero_amount_revenue_report() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, RevoraRevenueShare);
+    let client = RevoraRevenueShareClient::new(&env, &contract_id);
+
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    client.report_revenue(&issuer, &token, &0, &1, &false);
+
+    let empty_bl = Vec::<Address>::new(&env);
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                contract_id.clone(),
+                (symbol_short!("rev_init"), issuer.clone(), token.clone()).into_val(&env),
+                (0i128, 1u64, empty_bl.clone()).into_val(&env),
+            ),
+            (
+                contract_id.clone(),
+                (symbol_short!("rev_rep"), issuer.clone(), token.clone()).into_val(&env),
+                (0i128, 1u64, empty_bl).into_val(&env),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn large_revenue_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, RevoraRevenueShare);
+    let client = RevoraRevenueShareClient::new(&env, &contract_id);
+
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let large_amount: i128 = i128::MAX;
+    client.report_revenue(&issuer, &token, &large_amount, &u64::MAX, &false);
+
+    let empty_bl = Vec::<Address>::new(&env);
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                contract_id.clone(),
+                (symbol_short!("rev_init"), issuer.clone(), token.clone()).into_val(&env),
+                (large_amount, u64::MAX, empty_bl.clone()).into_val(&env),
+            ),
+            (
+                contract_id.clone(),
+                (symbol_short!("rev_rep"), issuer.clone(), token.clone()).into_val(&env),
+                (large_amount, u64::MAX, empty_bl).into_val(&env),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn negative_revenue_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, RevoraRevenueShare);
+    let client = RevoraRevenueShareClient::new(&env, &contract_id);
+
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // Negative revenue (e.g. clawback / adjustment)
+    let negative: i128 = -500_000;
+    client.report_revenue(&issuer, &token, &negative, &99, &false);
+
+    let empty_bl = Vec::<Address>::new(&env);
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                contract_id.clone(),
+                (symbol_short!("rev_init"), issuer.clone(), token.clone()).into_val(&env),
+                (negative, 99u64, empty_bl.clone()).into_val(&env),
+            ),
+            (
+                contract_id.clone(),
+                (symbol_short!("rev_rep"), issuer.clone(), token.clone()).into_val(&env),
+                (negative, 99u64, empty_bl).into_val(&env),
+            ),
+        ]
+    );
 }
 
 // ── original smoke test ───────────────────────────────────────
@@ -561,11 +1133,9 @@ const STORAGE_STRESS_OFFERING_COUNT: u32 = 200;
 #[test]
 fn storage_stress_many_offerings_no_panic() {
     let (env, client, issuer) = setup();
-    // Simulate many offerings within Soroban environment; ensure no panic or unexpected behavior.
     register_n(&env, &client, &issuer, STORAGE_STRESS_OFFERING_COUNT);
     let count = client.get_offering_count(&issuer);
     assert_eq!(count, STORAGE_STRESS_OFFERING_COUNT);
-    // Verify we can read back pages at the end of the range.
     let (page, cursor) =
         client.get_offerings_page(&issuer, &(STORAGE_STRESS_OFFERING_COUNT - 5), &10);
     assert_eq!(page.len(), 5);
@@ -581,7 +1151,6 @@ fn storage_stress_many_reports_no_panic() {
     let token = Address::generate(&env);
     client.register_offering(&issuer, &token, &1_000);
 
-    // Many report_revenue calls; storage growth is minimal (events only), but we stress the path.
     for period_id in 1..=100_u64 {
         client.report_revenue(
             &issuer,
@@ -616,19 +1185,16 @@ fn storage_stress_large_blacklist_no_panic() {
 
 #[test]
 fn gas_characterization_many_offerings_single_issuer() {
-    // Worst-case path: one issuer with many offerings. Measures get_offerings_page cost.
     let (env, client, issuer) = setup();
     let n = 50_u32;
     register_n(&env, &client, &issuer, n);
 
     let (page, _) = client.get_offerings_page(&issuer, &0, &20);
     assert_eq!(page.len(), 20);
-    // Pagination bounds cost: O(effective_limit) reads. Off-chain: prefer small page sizes.
 }
 
 #[test]
 fn gas_characterization_report_revenue_with_large_blacklist() {
-    // report_revenue reads full blacklist and emits it in the event; worst case for large lists.
     let env = Env::default();
     env.mock_all_auths();
     let client = make_client(&env);
@@ -641,11 +1207,10 @@ fn gas_characterization_report_revenue_with_large_blacklist() {
     }
     let admin = Address::generate(&env);
     env.mock_all_auths();
-    client.blacklist_add(&admin, &token, &Address::generate(&env)); // ensure admin is auth
+    client.blacklist_add(&admin, &token, &Address::generate(&env));
 
     client.report_revenue(&issuer, &token, &1_000_000, &1, &false);
     assert!(!env.events().all().is_empty());
-    // Expected: cost grows with blacklist size (map read + event payload). Recommend off-chain limits on blacklist size.
 }
 
 // ---------------------------------------------------------------------------
