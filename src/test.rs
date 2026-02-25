@@ -2996,7 +2996,7 @@ fn set_testnet_mode_emits_event() {
 
 #[test]
 fn issuer_transfer_accept_completes_transfer() {
-    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let (env, client, _issuer, token, _payment_token, _contract_id) = claim_setup();
     let new_issuer = Address::generate(&env);
 
     client.propose_issuer_transfer(&token, &new_issuer);
@@ -3612,7 +3612,7 @@ fn issuer_transfer_then_new_deposits_and_claims_work() {
 
 #[test]
 fn issuer_transfer_get_offering_still_works() {
-    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let (env, client, _issuer, token, _payment_token, _contract_id) = claim_setup();
     let new_issuer = Address::generate(&env);
 
     client.propose_issuer_transfer(&token, &new_issuer);
