@@ -1,4 +1,6 @@
 #![no_std]
+#![deny(unsafe_code)]
+#![deny(clippy::dbg_macro, clippy::todo, clippy::unimplemented)]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Map,
     String, Symbol, Vec,
@@ -1418,6 +1420,8 @@ impl RevoraRevenueShare {
     ///
     /// Rounding: Uses integer division which rounds down (floor).
     /// This is conservative and ensures the contract never over-distributes.
+    // This entrypoint shape is part of the public contract interface and mirrors
+    // off-chain inputs directly, so we allow this specific arity.
     #[allow(clippy::too_many_arguments)]
     pub fn calculate_distribution(
         env: Env,
