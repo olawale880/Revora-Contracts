@@ -5392,7 +5392,7 @@ fn aggregation_multiple_offerings_same_issuer() {
 
 #[test]
 fn aggregation_deposited_revenue_tracking() {
-    let (env, client, issuer, token, payment_token, _contract_id) = claim_setup();
+    let (_env, client, issuer, token, payment_token, _contract_id) = claim_setup();
 
     client.deposit_revenue(&issuer, &token, &payment_token, &100_000, &1);
     client.deposit_revenue(&issuer, &token, &payment_token, &200_000, &2);
@@ -5404,7 +5404,7 @@ fn aggregation_deposited_revenue_tracking() {
 
 #[test]
 fn aggregation_mixed_reported_and_deposited() {
-    let (env, client, issuer, token, payment_token, _contract_id) = claim_setup();
+    let (_env, client, issuer, token, payment_token, _contract_id) = claim_setup();
 
     // Report revenue
     client.report_revenue(&issuer, &token, &payment_token, &500_000, &1, &false);
@@ -5543,7 +5543,7 @@ fn issuer_registered_once_even_with_multiple_offerings() {
 
 #[test]
 fn get_total_deposited_revenue_per_offering() {
-    let (env, client, issuer, token, payment_token, _contract_id) = claim_setup();
+    let (_env, client, issuer, token, payment_token, _contract_id) = claim_setup();
 
     client.deposit_revenue(&issuer, &token, &payment_token, &50_000, &1);
     client.deposit_revenue(&issuer, &token, &payment_token, &75_000, &2);
