@@ -110,6 +110,30 @@ const EVENT_SHARE_SET: Symbol = symbol_short!("share_set");
 const EVENT_FREEZE: Symbol = symbol_short!("freeze");
 const EVENT_CLAIM_DELAY_SET: Symbol = symbol_short!("delay_set");
 
+const EVENT_PROPOSAL_CREATED: Symbol = symbol_short!("prop_new");
+const EVENT_PROPOSAL_APPROVED: Symbol = symbol_short!("prop_app");
+const EVENT_PROPOSAL_EXECUTED: Symbol = symbol_short!("prop_exe");
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProposalAction {
+    SetAdmin(Address),
+    Freeze,
+    SetThreshold(u32),
+    AddOwner(Address),
+    RemoveOwner(Address),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Proposal {
+    pub id: u32,
+    pub action: ProposalAction,
+    pub proposer: Address,
+    pub approvals: Vec<Address>,
+    pub executed: bool,
+}
+
  
 const EVENT_SNAP_CONFIG: Symbol = symbol_short!("snap_cfg");
 
@@ -122,6 +146,7 @@ const EVENT_ISSUER_TRANSFER_PROPOSED: Symbol = symbol_short!("iss_prop");
 const EVENT_ISSUER_TRANSFER_ACCEPTED: Symbol = symbol_short!("iss_acc");
 const EVENT_ISSUER_TRANSFER_CANCELLED: Symbol = symbol_short!("iss_canc");
 const EVENT_TESTNET_MODE: Symbol = symbol_short!("test_mode");
+
 const EVENT_INIT: Symbol = symbol_short!("init");
 const EVENT_PAUSED: Symbol = symbol_short!("paused");
 const EVENT_UNPAUSED: Symbol = symbol_short!("unpaused");
@@ -241,6 +266,15 @@ pub enum DataKey {
     /// Contract frozen flag; when true, state-changing ops are disabled (#32).
     Frozen,
 
+    /// Multisig admin threshold.
+    MultisigThreshold,
+    /// Multisig admin owners.
+    MultisigOwners,
+    /// Multisig proposal by ID.
+    MultisigProposal(u32),
+    /// Multisig proposal count.
+    MultisigProposalCount,
+
  
     /// Per (issuer, token): whether snapshot distribution is enabled.
     SnapshotConfig(Address, Address),
@@ -310,12 +344,7 @@ impl RevoraRevenueShare {
     /// Returns error if contract is frozen (#32). Call at start of state-mutating entrypoints.
     fn require_not_frozen(env: &Env) -> Result<(), RevoraError> {
         let key = DataKey::Frozen;
-        if env
-            .storage()
-            .persistent()
-            .get::<DataKey, bool>(&key)
-            .unwrap_or(false)
-        {
+        if env.storage().persistent().get::<DataKey, bool>(&key).unwrap_or(false) {
             return Err(RevoraError::ContractFrozen);
         }
         Ok(())
@@ -419,9 +448,7 @@ impl RevoraRevenueShare {
         if env.storage().persistent().has(&DataKey::Admin) {
             panic!("already initialized");
         }
-        env.storage()
-            .persistent()
-            .set(&DataKey::Admin, &admin.clone());
+        env.storage().persistent().set(&DataKey::Admin, &admin.clone());
         if let Some(s) = safety.clone() {
             env.storage().persistent().set(&DataKey::Safety, &s);
         }
@@ -434,11 +461,8 @@ impl RevoraRevenueShare {
     /// Pause the contract (admin only). Idempotent.
     pub fn pause_admin(env: Env, caller: Address) {
         caller.require_auth();
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .expect("admin not set");
+        let admin: Address =
+            env.storage().persistent().get(&DataKey::Admin).expect("admin not set");
         if caller != admin {
             panic!("not admin");
         }
@@ -449,11 +473,8 @@ impl RevoraRevenueShare {
     /// Unpause the contract (admin only). Idempotent.
     pub fn unpause_admin(env: Env, caller: Address) {
         caller.require_auth();
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .expect("admin not set");
+        let admin: Address =
+            env.storage().persistent().get(&DataKey::Admin).expect("admin not set");
         if caller != admin {
             panic!("not admin");
         }
@@ -464,11 +485,8 @@ impl RevoraRevenueShare {
     /// Pause the contract (safety role only). Idempotent.
     pub fn pause_safety(env: Env, caller: Address) {
         caller.require_auth();
-        let safety: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Safety)
-            .expect("safety not set");
+        let safety: Address =
+            env.storage().persistent().get(&DataKey::Safety).expect("safety not set");
         if caller != safety {
             panic!("not safety");
         }
@@ -479,11 +497,8 @@ impl RevoraRevenueShare {
     /// Unpause the contract (safety role only). Idempotent.
     pub fn unpause_safety(env: Env, caller: Address) {
         caller.require_auth();
-        let safety: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Safety)
-            .expect("safety not set");
+        let safety: Address =
+            env.storage().persistent().get(&DataKey::Safety).expect("safety not set");
         if caller != safety {
             panic!("not safety");
         }
@@ -493,20 +508,12 @@ impl RevoraRevenueShare {
 
     /// Query the paused state of the contract.
     pub fn is_paused(env: Env) -> bool {
-        env.storage()
-            .persistent()
-            .get::<DataKey, bool>(&DataKey::Paused)
-            .unwrap_or(false)
+        env.storage().persistent().get::<DataKey, bool>(&DataKey::Paused).unwrap_or(false)
     }
 
     /// Helper: panic if contract is paused. Used by state-mutating entrypoints.
     fn require_not_paused(env: &Env) {
-        if env
-            .storage()
-            .persistent()
-            .get::<DataKey, bool>(&DataKey::Paused)
-            .unwrap_or(false)
-        {
+        if env.storage().persistent().get::<DataKey, bool>(&DataKey::Paused).unwrap_or(false) {
             panic!("contract is paused");
         }
  
@@ -540,6 +547,20 @@ impl RevoraRevenueShare {
         let count_key = DataKey::OfferCount(issuer.clone());
         let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
 
+
+        let offering = Offering { issuer: issuer.clone(), token: token.clone(), revenue_share_bps };
+
+        let offering = Offering {
+            issuer: issuer.clone(),
+            token: token.clone(),
+            revenue_share_bps,
+            payout_asset: payout_asset.clone(),
+        };
+
+
+        let item_key = DataKey::OfferItem(issuer.clone(), count);
+        env.storage().persistent().set(&item_key, &offering);
+        env.storage().persistent().set(&count_key, &(count + 1));
             let offering = Offering {
                 issuer: issuer.clone(),
                 token: token.clone(),
@@ -575,10 +596,14 @@ impl RevoraRevenueShare {
             env.storage().persistent().set(&registered_key, &true);
         }
 
+
+        env.events().publish((symbol_short!("offer_reg"), issuer), (token, revenue_share_bps));
+
         env.events().publish(
             (symbol_short!("offer_reg"), issuer.clone()),
             (token.clone(), revenue_share_bps, payout_asset.clone()),
         );
+
         // Optionally emit a versioned v1 event with explicit version field
         if Self::is_event_versioning_enabled(env.clone()) {
             env.events().publish(
@@ -752,10 +777,8 @@ impl RevoraRevenueShare {
         if !testnet_mode {
             // Holder concentration guardrail (#26): reject if enforce and over limit
             let limit_key = DataKey::ConcentrationLimit(issuer.clone(), token.clone());
-            if let Some(config) = env
-                .storage()
-                .persistent()
-                .get::<DataKey, ConcentrationLimitConfig>(&limit_key)
+            if let Some(config) =
+                env.storage().persistent().get::<DataKey, ConcentrationLimitConfig>(&limit_key)
             {
                 if config.enforce && config.max_bps > 0 {
                     let curr_key = DataKey::CurrentConcentration(issuer.clone(), token.clone());
@@ -770,6 +793,10 @@ impl RevoraRevenueShare {
         let blacklist = Self::get_blacklist(env.clone(), token.clone());
         let current_timestamp = env.ledger().timestamp();
 
+        let key = DataKey::RevenueReports(issuer.clone(), token.clone());
+        let mut reports: Map<u64, (i128, u64)> =
+            env.storage().persistent().get(&key).unwrap_or_else(|| Map::new(&env));
+        let current_timestamp = env.ledger().timestamp();
         let report_key = DataKey::RevenueReports(issuer.clone(), token.clone());
         let mut reports: Map<u64, (i128, u64)> = env
             .storage()
@@ -858,6 +885,16 @@ impl RevoraRevenueShare {
             (amount, period_id),
         );
 
+        // Audit log summary (#34): maintain per-offering total revenue and report count
+        let summary_key = DataKey::AuditSummary(issuer.clone(), token.clone());
+        let mut summary: AuditSummary = env
+            .storage()
+            .persistent()
+            .get(&summary_key)
+            .unwrap_or(AuditSummary { total_revenue: 0, report_count: 0 });
+        summary.total_revenue = summary.total_revenue.saturating_add(amount);
+        summary.report_count = summary.report_count.saturating_add(1);
+        env.storage().persistent().set(&summary_key, &summary);
         // Optionally emit versioned v1 events for forward-compatible consumers
         if Self::is_event_versioning_enabled(env.clone()) {
             env.events().publish(
@@ -938,11 +975,8 @@ impl RevoraRevenueShare {
     ) -> (Vec<Offering>, Option<u32>) {
         let count = Self::get_offering_count(env.clone(), issuer.clone());
 
-        let effective_limit = if limit == 0 || limit > MAX_PAGE_LIMIT {
-            MAX_PAGE_LIMIT
-        } else {
-            limit
-        };
+        let effective_limit =
+            if limit == 0 || limit > MAX_PAGE_LIMIT { MAX_PAGE_LIMIT } else { limit };
 
         if start >= count {
             return (Vec::new(&env), None);
@@ -993,16 +1027,14 @@ impl RevoraRevenueShare {
         }
 
         let key = DataKey::Blacklist(token.clone());
-        let mut map: Map<Address, bool> = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| Map::new(&env));
+        let mut map: Map<Address, bool> =
+            env.storage().persistent().get(&key).unwrap_or_else(|| Map::new(&env));
 
         let was_present = map.get(investor.clone()).unwrap_or(false);
         map.set(investor.clone(), true);
         env.storage().persistent().set(&key, &map);
 
+        env.events().publish((EVENT_BL_ADD, token, caller), investor);
         // Maintain insertion order for deterministic get_blacklist (#38)
         if !was_present {
             let order_key = DataKey::BlacklistOrder(token.clone());
@@ -1048,11 +1080,8 @@ impl RevoraRevenueShare {
         }
 
         let key = DataKey::Blacklist(token.clone());
-        let mut map: Map<Address, bool> = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| Map::new(&env));
+        let mut map: Map<Address, bool> =
+            env.storage().persistent().get(&key).unwrap_or_else(|| Map::new(&env));
 
             map.remove(investor.clone());
             env.storage().persistent().set(&key, &map);
@@ -1074,8 +1103,7 @@ impl RevoraRevenueShare {
         }
         env.storage().persistent().set(&order_key, &new_order);
 
-        env.events()
-            .publish((EVENT_BL_REM, token, caller), investor);
+        env.events().publish((EVENT_BL_REM, token, caller), investor);
         Ok(())
     }
 
@@ -1101,6 +1129,24 @@ impl RevoraRevenueShare {
 
     // ── Whitelist management ──────────────────────────────────
 
+    /// Set per-offering concentration limit. Caller must be the offering issuer.
+    /// `max_bps`: max allowed single-holder share in basis points (0 = disable).
+    /// `enforce`: if true, report_revenue will fail when reported concentration exceeds max_bps.
+    pub fn set_concentration_limit(
+        env: Env,
+        issuer: Address,
+        token: Address,
+        max_bps: u32,
+        enforce: bool,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        issuer.require_auth();
+        if Self::get_offering(env.clone(), issuer.clone(), token.clone()).is_none() {
+            return Err(RevoraError::LimitReached); // reuse: "offering not found" semantics
+        }
+        let key = DataKey::ConcentrationLimit(issuer, token);
+        env.storage().persistent().set(&key, &ConcentrationLimitConfig { max_bps, enforce });
+        Ok(())
     /// Add `investor` to the per-offering whitelist for `token`.
     ///
     /// Idempotent — calling with an already-whitelisted address is safe.
@@ -1210,6 +1256,9 @@ impl RevoraRevenueShare {
         concentration_bps: u32,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
+        issuer.require_auth();
+        let curr_key = DataKey::CurrentConcentration(issuer.clone(), token.clone());
+        env.storage().persistent().set(&curr_key, &concentration_bps);
 
         // Verify offering exists and issuer is current
         let current_issuer =
@@ -1228,10 +1277,8 @@ impl RevoraRevenueShare {
         }
 
         let limit_key = DataKey::ConcentrationLimit(issuer.clone(), token.clone());
-        if let Some(config) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, ConcentrationLimitConfig>(&limit_key)
+        if let Some(config) =
+            env.storage().persistent().get::<DataKey, ConcentrationLimitConfig>(&limit_key)
         {
             if config.max_bps > 0 && concentration_bps > config.max_bps {
                 env.events().publish(
@@ -1297,10 +1344,7 @@ impl RevoraRevenueShare {
     /// Get rounding mode for an offering. Defaults to Truncation if not set.
     pub fn get_rounding_mode(env: Env, issuer: Address, token: Address) -> RoundingMode {
         let key = DataKey::RoundingMode(issuer, token);
-        env.storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or(RoundingMode::Truncation)
+        env.storage().persistent().get(&key).unwrap_or(RoundingMode::Truncation)
     }
 
     // ── Per-offering minimum revenue threshold (#25) ─────────────────────
@@ -1361,11 +1405,8 @@ impl RevoraRevenueShare {
             RoundingMode::Truncation => raw.checked_div(10_000).unwrap_or(0),
             RoundingMode::RoundHalfUp => {
                 let half = 5_000_i128;
-                let adjusted = if raw >= 0 {
-                    raw.saturating_add(half)
-                } else {
-                    raw.saturating_sub(half)
-                };
+                let adjusted =
+                    if raw >= 0 { raw.saturating_add(half) } else { raw.saturating_sub(half) };
                 adjusted.checked_div(10_000).unwrap_or(0)
             }
         };
@@ -1497,6 +1538,8 @@ impl RevoraRevenueShare {
             return Err(RevoraError::OfferingNotFound);
         }
 
+        env.events()
+            .publish((EVENT_REV_DEPOSIT, issuer, token), (payment_token, amount, period_id));
         let key = DataKey::SnapshotConfig(issuer.clone(), token.clone());
         env.storage().persistent().set(&key, &enabled);
 
@@ -1546,8 +1589,7 @@ impl RevoraRevenueShare {
         let key = DataKey::HolderShare(token.clone(), holder.clone());
         env.storage().persistent().set(&key, &share_bps);
 
-        env.events()
-            .publish((EVENT_SHARE_SET, issuer, token), (holder, share_bps));
+        env.events().publish((EVENT_SHARE_SET, issuer, token), (holder, share_bps));
         Ok(())
     }
 
@@ -1644,10 +1686,7 @@ impl RevoraRevenueShare {
         // Advance claim index only for periods actually claimed (respecting delay)
         env.storage().persistent().set(&idx_key, &last_claimed_idx);
 
-        env.events().publish(
-            (EVENT_CLAIM, holder.clone(), token),
-            (total_payout, claimed_periods),
-        );
+        env.events().publish((EVENT_CLAIM, holder.clone(), token), (total_payout, claimed_periods));
 
         Ok(total_payout)
     }
@@ -1726,8 +1765,7 @@ impl RevoraRevenueShare {
         issuer.require_auth();
         let key = DataKey::ClaimDelaySecs(token.clone());
         env.storage().persistent().set(&key, &delay_secs);
-        env.events()
-            .publish((EVENT_CLAIM_DELAY_SET, issuer, token), delay_secs);
+        env.events().publish((EVENT_CLAIM_DELAY_SET, issuer, token), delay_secs);
         Ok(())
     }
 
@@ -1768,16 +1806,17 @@ impl RevoraRevenueShare {
             total = total.saturating_add(payout);
             payouts.push_back((holder.clone(), payout));
         }
-        SimulateDistributionResult {
-            total_distributed: total,
-            payouts,
-        }
+        SimulateDistributionResult { total_distributed: total, payouts }
     }
 
     // ── Upgradeability guard and freeze (#32) ───────────────────
 
     /// Set the admin address. May only be called once; caller must authorize as the new admin.
+    /// If multisig is initialized, this function is disabled in favor of execute_action(SetAdmin).
     pub fn set_admin(env: Env, admin: Address) -> Result<(), RevoraError> {
+        if env.storage().persistent().has(&DataKey::MultisigThreshold) {
+            return Err(RevoraError::LimitReached);
+        }
         admin.require_auth();
         let key = DataKey::Admin;
         if env.storage().persistent().has(&key) {
@@ -1795,13 +1834,14 @@ impl RevoraRevenueShare {
 
     /// Freeze the contract: no further state-changing operations allowed. Only admin may call.
     /// Emits event. Claim and read-only functions remain allowed.
+    /// If multisig is initialized, this function is disabled in favor of execute_action(Freeze).
     pub fn freeze(env: Env) -> Result<(), RevoraError> {
+        if env.storage().persistent().has(&DataKey::MultisigThreshold) {
+            return Err(RevoraError::LimitReached);
+        }
         let key = DataKey::Admin;
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .ok_or(RevoraError::LimitReached)?;
+        let admin: Address =
+            env.storage().persistent().get(&key).ok_or(RevoraError::LimitReached)?;
         admin.require_auth();
         let frozen_key = DataKey::Frozen;
         env.storage().persistent().set(&frozen_key, &true);
@@ -1811,10 +1851,200 @@ impl RevoraRevenueShare {
 
     /// Return true if the contract is frozen.
     pub fn is_frozen(env: Env) -> bool {
-        env.storage()
+        env.storage().persistent().get::<DataKey, bool>(&DataKey::Frozen).unwrap_or(false)
+    }
+
+    // ── Multisig admin logic ───────────────────────────────────
+
+    /// Initialize the multisig admin system. May only be called once.
+    /// Only the caller (deployer/admin) needs to authorize; owners are registered
+    /// without requiring their individual signatures at init time.
+    ///
+    /// # Soroban Limitation Note
+    /// Soroban does not support requiring multiple signers in a single transaction
+    /// invocation. Each owner must separately call `approve_action` to sign proposals.
+    pub fn init_multisig(
+        env: Env,
+        caller: Address,
+        owners: Vec<Address>,
+        threshold: u32,
+    ) -> Result<(), RevoraError> {
+        caller.require_auth();
+        if env.storage().persistent().has(&DataKey::MultisigThreshold) {
+            return Err(RevoraError::LimitReached); // Already initialized
+        }
+        if owners.is_empty() {
+            return Err(RevoraError::LimitReached); // Must have at least one owner
+        }
+        if threshold == 0 || threshold > owners.len() {
+            return Err(RevoraError::LimitReached); // Improper threshold
+        }
+        env.storage().persistent().set(&DataKey::MultisigThreshold, &threshold);
+        env.storage().persistent().set(&DataKey::MultisigOwners, &owners);
+        env.storage().persistent().set(&DataKey::MultisigProposalCount, &0_u32);
+        Ok(())
+    }
+
+    /// Propose a sensitive administrative action.
+    /// The proposer's address is automatically counted as the first approval.
+    pub fn propose_action(
+        env: Env,
+        proposer: Address,
+        action: ProposalAction,
+    ) -> Result<u32, RevoraError> {
+        proposer.require_auth();
+        Self::require_multisig_owner(&env, &proposer)?;
+
+        let count_key = DataKey::MultisigProposalCount;
+        let id: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+
+        // Proposer's vote counts as the first approval automatically
+        let mut initial_approvals = Vec::new(&env);
+        initial_approvals.push_back(proposer.clone());
+
+        let proposal = Proposal {
+            id,
+            action,
+            proposer: proposer.clone(),
+            approvals: initial_approvals,
+            executed: false,
+        };
+
+        env.storage().persistent().set(&DataKey::MultisigProposal(id), &proposal);
+        env.storage().persistent().set(&count_key, &(id + 1));
+
+        env.events().publish((EVENT_PROPOSAL_CREATED, proposer.clone()), id);
+        env.events().publish((EVENT_PROPOSAL_APPROVED, proposer), id);
+        Ok(id)
+    }
+
+    /// Approve an existing multisig proposal.
+    pub fn approve_action(
+        env: Env,
+        approver: Address,
+        proposal_id: u32,
+    ) -> Result<(), RevoraError> {
+        approver.require_auth();
+        Self::require_multisig_owner(&env, &approver)?;
+
+        let key = DataKey::MultisigProposal(proposal_id);
+        let mut proposal: Proposal =
+            env.storage().persistent().get(&key).ok_or(RevoraError::OfferingNotFound)?;
+
+        if proposal.executed {
+            return Err(RevoraError::LimitReached);
+        }
+
+        // Check for duplicate approvals
+        for i in 0..proposal.approvals.len() {
+            if proposal.approvals.get(i).unwrap() == approver {
+                return Ok(()); // Already approved
+            }
+        }
+
+        proposal.approvals.push_back(approver.clone());
+        env.storage().persistent().set(&key, &proposal);
+
+        env.events().publish((EVENT_PROPOSAL_APPROVED, approver), proposal_id);
+        Ok(())
+    }
+
+    /// Execute a proposal if it has met the required threshold.
+    pub fn execute_action(env: Env, proposal_id: u32) -> Result<(), RevoraError> {
+        let key = DataKey::MultisigProposal(proposal_id);
+        let mut proposal: Proposal =
+            env.storage().persistent().get(&key).ok_or(RevoraError::OfferingNotFound)?;
+
+        if proposal.executed {
+            return Err(RevoraError::LimitReached);
+        }
+
+        let threshold: u32 = env
+            .storage()
             .persistent()
-            .get::<DataKey, bool>(&DataKey::Frozen)
-            .unwrap_or(false)
+            .get(&DataKey::MultisigThreshold)
+            .ok_or(RevoraError::LimitReached)?;
+
+        if proposal.approvals.len() < threshold {
+            return Err(RevoraError::LimitReached); // Threshold not met
+        }
+
+        // Execute the action
+        match proposal.action.clone() {
+            ProposalAction::SetAdmin(new_admin) => {
+                env.storage().persistent().set(&DataKey::Admin, &new_admin);
+            }
+            ProposalAction::Freeze => {
+                env.storage().persistent().set(&DataKey::Frozen, &true);
+                env.events().publish((EVENT_FREEZE, proposal.proposer.clone()), true);
+            }
+            ProposalAction::SetThreshold(new_threshold) => {
+                let owners: Vec<Address> =
+                    env.storage().persistent().get(&DataKey::MultisigOwners).unwrap();
+                if new_threshold == 0 || new_threshold > owners.len() {
+                    return Err(RevoraError::InvalidShareBps);
+                }
+                env.storage().persistent().set(&DataKey::MultisigThreshold, &new_threshold);
+            }
+            ProposalAction::AddOwner(new_owner) => {
+                let mut owners: Vec<Address> =
+                    env.storage().persistent().get(&DataKey::MultisigOwners).unwrap();
+                owners.push_back(new_owner);
+                env.storage().persistent().set(&DataKey::MultisigOwners, &owners);
+            }
+            ProposalAction::RemoveOwner(old_owner) => {
+                let owners: Vec<Address> =
+                    env.storage().persistent().get(&DataKey::MultisigOwners).unwrap();
+                let mut new_owners = Vec::new(&env);
+                for i in 0..owners.len() {
+                    let owner = owners.get(i).unwrap();
+                    if owner != old_owner {
+                        new_owners.push_back(owner);
+                    }
+                }
+                let threshold: u32 =
+                    env.storage().persistent().get(&DataKey::MultisigThreshold).unwrap();
+                if new_owners.len() < threshold || new_owners.is_empty() {
+                    return Err(RevoraError::LimitReached); // Would break threshold
+                }
+                env.storage().persistent().set(&DataKey::MultisigOwners, &new_owners);
+            }
+        }
+
+        proposal.executed = true;
+        env.storage().persistent().set(&key, &proposal);
+
+        env.events().publish((EVENT_PROPOSAL_EXECUTED, proposal_id), true);
+        Ok(())
+    }
+
+    /// Get a proposal by ID. Returns None if not found.
+    pub fn get_proposal(env: Env, proposal_id: u32) -> Option<Proposal> {
+        env.storage().persistent().get(&DataKey::MultisigProposal(proposal_id))
+    }
+
+    /// Get the current multisig owners list.
+    pub fn get_multisig_owners(env: Env) -> Vec<Address> {
+        env.storage().persistent().get(&DataKey::MultisigOwners).unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Get the current multisig threshold.
+    pub fn get_multisig_threshold(env: Env) -> Option<u32> {
+        env.storage().persistent().get(&DataKey::MultisigThreshold)
+    }
+
+    fn require_multisig_owner(env: &Env, caller: &Address) -> Result<(), RevoraError> {
+        let owners: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MultisigOwners)
+            .ok_or(RevoraError::LimitReached)?;
+        for i in 0..owners.len() {
+            if owners.get(i).unwrap() == *caller {
+                return Ok(());
+            }
+        }
+        Err(RevoraError::LimitReached)
     }
 
     // ── Secure issuer transfer (two-step flow) ─────────────────
@@ -2160,11 +2390,8 @@ impl RevoraRevenueShare {
     /// Emits event with new mode state.
     pub fn set_testnet_mode(env: Env, enabled: bool) -> Result<(), RevoraError> {
         let key = DataKey::Admin;
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .ok_or(RevoraError::LimitReached)?;
+        let admin: Address =
+            env.storage().persistent().get(&key).ok_or(RevoraError::LimitReached)?;
         admin.require_auth();
         if !Self::is_event_only(&env) {
             let mode_key = DataKey::TestnetMode;
@@ -2176,10 +2403,7 @@ impl RevoraRevenueShare {
 
     /// Return true if testnet mode is enabled.
     pub fn is_testnet_mode(env: Env) -> bool {
-        env.storage()
-            .persistent()
-            .get::<DataKey, bool>(&DataKey::TestnetMode)
-            .unwrap_or(false)
+        env.storage().persistent().get::<DataKey, bool>(&DataKey::TestnetMode).unwrap_or(false)
     }
 
     // ── Cross-offering aggregation queries (#39) ──────────────────
