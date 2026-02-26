@@ -43,6 +43,10 @@ pub enum RevoraError {
     PayoutAssetMismatch = 15,
     /// Metadata string exceeds maximum allowed length.
     MetadataTooLarge = 16,
+    /// Caller is not authorized to perform this action.
+    NotAuthorized = 17,
+    /// Contract is not initialized (admin not set).
+    NotInitialized = 18,
     /// Amount is invalid (e.g. negative for deposit, or out of allowed range) (#35).
     InvalidAmount = 17,
     /// period_id is invalid (e.g. zero when required to be positive) (#35).
@@ -770,6 +774,15 @@ impl RevoraRevenueShare {
         Self::require_not_paused(&env);
         caller.require_auth();
 
+        // Verify auth: caller must be issuer or admin
+        let current_issuer =
+            Self::get_current_issuer(&env, &token).ok_or(RevoraError::OfferingNotFound)?;
+        let admin = Self::get_admin(env.clone()).ok_or(RevoraError::NotInitialized)?;
+
+        if caller != current_issuer && caller != admin {
+            return Err(RevoraError::NotAuthorized);
+        }
+
         let key = DataKey::Blacklist(token.clone());
         let mut map: Map<Address, bool> = env
             .storage()
@@ -808,6 +821,15 @@ impl RevoraRevenueShare {
         Self::require_not_frozen(&env)?;
         Self::require_not_paused(&env);
         caller.require_auth();
+
+        // Verify auth: caller must be issuer or admin
+        let current_issuer =
+            Self::get_current_issuer(&env, &token).ok_or(RevoraError::OfferingNotFound)?;
+        let admin = Self::get_admin(env.clone()).ok_or(RevoraError::NotInitialized)?;
+
+        if caller != current_issuer && caller != admin {
+            return Err(RevoraError::NotAuthorized);
+        }
 
         let key = DataKey::Blacklist(token.clone());
         let mut map: Map<Address, bool> = env
@@ -1956,3 +1978,5 @@ impl RevoraRevenueShare {
 }
 
 mod test;
+mod test_auth;
+mod test_cross_contract;

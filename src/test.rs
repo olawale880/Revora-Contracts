@@ -1944,8 +1944,8 @@ fn compute_share_no_overflow_bounds() {
 /// Returns (token_contract_address, admin_address).
 fn create_payment_token(env: &Env) -> (Address, Address) {
     let admin = Address::generate(env);
-    let token_id = env.register_stellar_asset_contract_v2(admin.clone());
-    (token_id.address().clone(), admin)
+    let token_id = env.register_stellar_asset_contract(admin.clone());
+    (token_id, admin)
 }
 
 /// Mint `amount` of payment token to `recipient`.
@@ -2793,7 +2793,7 @@ fn claim_before_delay_returns_claim_delay_not_elapsed() {
     let (env, client, issuer, token, payment_token, _contract_id) = claim_setup();
     let holder = Address::generate(&env);
 
-    env.ledger().set_timestamp(1000);
+    env.ledger().with_mut(|li| li.timestamp = 1000);
     client.set_holder_share(&issuer, &token, &holder, &10_000);
     client.set_claim_delay(&issuer, &token, &100);
     client.deposit_revenue(&issuer, &token, &payment_token, &100_000, &1);
@@ -2807,11 +2807,11 @@ fn claim_after_delay_succeeds() {
     let (env, client, issuer, token, payment_token, _contract_id) = claim_setup();
     let holder = Address::generate(&env);
 
-    env.ledger().set_timestamp(1000);
+    env.ledger().with_mut(|li| li.timestamp = 1000);
     client.set_holder_share(&issuer, &token, &holder, &10_000);
     client.set_claim_delay(&issuer, &token, &100);
     client.deposit_revenue(&issuer, &token, &payment_token, &100_000, &1);
-    env.ledger().set_timestamp(1100);
+    env.ledger().with_mut(|li| li.timestamp = 1100);
     let payout = client.claim(&holder, &token, &0);
     assert_eq!(payout, 100_000);
     assert_eq!(balance(&env, &payment_token, &holder), 100_000);
@@ -2822,13 +2822,13 @@ fn get_claimable_respects_delay() {
     let (env, client, issuer, token, payment_token, _contract_id) = claim_setup();
     let holder = Address::generate(&env);
 
-    env.ledger().set_timestamp(2000);
+    env.ledger().with_mut(|li| li.timestamp = 2000);
     client.set_holder_share(&issuer, &token, &holder, &5_000);
     client.set_claim_delay(&issuer, &token, &500);
     client.deposit_revenue(&issuer, &token, &payment_token, &100_000, &1);
     // At 2000, deposit at 2000, claimable at 2500
     assert_eq!(client.get_claimable(&token, &holder), 0);
-    env.ledger().set_timestamp(2500);
+    env.ledger().with_mut(|li| li.timestamp = 2500);
     assert_eq!(client.get_claimable(&token, &holder), 50_000);
 }
 
@@ -2837,18 +2837,18 @@ fn claim_delay_partial_periods_only_claimable_after_delay() {
     let (env, client, issuer, token, payment_token, _contract_id) = claim_setup();
     let holder = Address::generate(&env);
 
-    env.ledger().set_timestamp(1000);
+    env.ledger().with_mut(|li| li.timestamp = 1000);
     client.set_holder_share(&issuer, &token, &holder, &10_000);
     client.set_claim_delay(&issuer, &token, &100);
     client.deposit_revenue(&issuer, &token, &payment_token, &100_000, &1);
-    env.ledger().set_timestamp(1050);
+    env.ledger().with_mut(|li| li.timestamp = 1050);
     client.deposit_revenue(&issuer, &token, &payment_token, &200_000, &2);
     // At 1100: period 1 claimable (1000+100<=1100), period 2 not (1050+100>1100)
-    env.ledger().set_timestamp(1100);
+    env.ledger().with_mut(|li| li.timestamp = 1100);
     let payout = client.claim(&holder, &token, &0);
     assert_eq!(payout, 100_000);
     // At 1160: period 2 claimable (1050+100<=1160)
-    env.ledger().set_timestamp(1160);
+    env.ledger().with_mut(|li| li.timestamp = 1160);
     let payout2 = client.claim(&holder, &token, &0);
     assert_eq!(payout2, 200_000);
 }
