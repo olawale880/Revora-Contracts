@@ -92,6 +92,7 @@ const EVENT_REV_BELOW_THRESHOLD: Symbol = symbol_short!("rev_below");
 
 const BPS_DENOMINATOR: i128 = 10_000;
 
+// ── Data structures ──────────────────────────────────────────
 /// Contract version identifier (#23). Bumped when storage or semantics change; used for migration and compatibility.
 pub const CONTRACT_VERSION: u32 = 1;
 
@@ -156,8 +157,8 @@ pub enum RoundingMode {
 /// Multi-period claim keys use PeriodRevenue/PeriodEntry/PeriodCount for per-offering
 /// period tracking, HolderShare for holder allocations, LastClaimedIdx for claim progress,
 /// and PaymentToken for the token used to pay out revenue.
+/// `RevenueIndex` and `RevenueReports` track reported (un-deposited) revenue totals and details.
 #[contracttype]
-#[derive(Clone)]
 pub enum DataKey {
     Blacklist(Address),
     /// Per-token: blacklist addresses in insertion order for deterministic get_blacklist (#38).
@@ -174,6 +175,8 @@ pub enum DataKey {
     RoundingMode(Address, Address),
     /// Per (issuer, token): revenue reports map (period_id -> (amount, timestamp)).
     RevenueReports(Address, Address),
+    /// FLAT INDEX per (token, period_id): cumulative reported revenue amount.
+    RevenueIndex(Address, u64),
     /// Revenue amount deposited for (offering_token, period_id).
     PeriodRevenue(Address, u64),
     /// Maps (offering_token, sequential_index) -> period_id for enumeration.
@@ -232,6 +235,7 @@ const MAX_PLATFORM_FEE_BPS: u32 = 5_000;
 /// Keeps compute costs predictable within Soroban limits.
 const MAX_CLAIM_PERIODS: u32 = 50;
 
+// ── Contract ─────────────────────────────────────────────────
 #[contract]
 pub struct RevoraRevenueShare;
 
@@ -385,6 +389,8 @@ impl RevoraRevenueShare {
         }
     }
 
+    // ── Offering management ───────────────────────────────────
+
     /// Register a new revenue-share offering.
     /// Returns `Err(RevoraError::InvalidRevenueShareBps)` if revenue_share_bps > 10000.
     /// In testnet mode, bps validation is skipped to allow flexible testing.
@@ -404,7 +410,6 @@ impl RevoraRevenueShare {
         if !testnet_mode && revenue_share_bps > 10_000 {
             return Err(RevoraError::InvalidRevenueShareBps);
         }
-
         let count_key = DataKey::OfferCount(issuer.clone());
         let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
 
@@ -488,6 +493,9 @@ impl RevoraRevenueShare {
     /// Fails with `ConcentrationLimitExceeded` (#26) if concentration enforcement is on and current concentration exceeds limit.
     /// In testnet mode, concentration enforcement is skipped.
     /// `override_existing`: if true, allows overwriting a previously reported period.
+    ///
+    /// The event payload includes the current blacklist so off-chain
+    /// distribution engines can filter recipients in the same atomic step.
     pub fn report_revenue(
         env: Env,
         issuer: Address,
@@ -541,8 +549,8 @@ impl RevoraRevenueShare {
             {
                 if config.enforce && config.max_bps > 0 {
                     let curr_key = DataKey::CurrentConcentration(issuer.clone(), token.clone());
-                    let current: u32 = env.storage().persistent().get(&curr_key).unwrap_or(0);
-                    if current > config.max_bps {
+                    let current_bps: u32 = env.storage().persistent().get(&curr_key).unwrap_or(0);
+                    if current_bps > config.max_bps {
                         return Err(RevoraError::ConcentrationLimitExceeded);
                     }
                 }
@@ -550,20 +558,33 @@ impl RevoraRevenueShare {
         }
 
         let blacklist = Self::get_blacklist(env.clone(), token.clone());
+        let current_timestamp = env.ledger().timestamp();
 
-        let key = DataKey::RevenueReports(issuer.clone(), token.clone());
+        let report_key = DataKey::RevenueReports(issuer.clone(), token.clone());
         let mut reports: Map<u64, (i128, u64)> = env
             .storage()
             .persistent()
-            .get(&key)
+            .get(&report_key)
             .unwrap_or_else(|| Map::new(&env));
-        let current_timestamp = env.ledger().timestamp();
+
+        let idx_key = DataKey::RevenueIndex(token.clone(), period_id);
+        let mut cumulative_revenue: i128 = env.storage().persistent().get(&idx_key).unwrap_or(0);
 
         match reports.get(period_id) {
             Some((existing_amount, _timestamp)) => {
                 if override_existing {
+                    // Update index: remove old, add new
+                    cumulative_revenue = cumulative_revenue
+                        .checked_sub(existing_amount)
+                        .unwrap_or(cumulative_revenue)
+                        .checked_add(amount)
+                        .unwrap_or(amount);
+                    env.storage()
+                        .persistent()
+                        .set(&idx_key, &cumulative_revenue);
+
                     reports.set(period_id, (amount, current_timestamp));
-                    env.storage().persistent().set(&key, &reports);
+                    env.storage().persistent().set(&report_key, &reports);
 
                     env.events().publish(
                         (EVENT_REVENUE_REPORT_OVERRIDE, issuer.clone(), token.clone()),
@@ -597,8 +618,14 @@ impl RevoraRevenueShare {
                 }
             }
             None => {
+                // Initial report for this period
+                cumulative_revenue = cumulative_revenue.checked_add(amount).unwrap_or(amount);
+                env.storage()
+                    .persistent()
+                    .set(&idx_key, &cumulative_revenue);
+
                 reports.set(period_id, (amount, current_timestamp));
-                env.storage().persistent().set(&key, &reports);
+                env.storage().persistent().set(&report_key, &reports);
 
                 env.events().publish(
                     (EVENT_REVENUE_REPORT_INITIAL, issuer.clone(), token.clone()),
@@ -616,8 +643,6 @@ impl RevoraRevenueShare {
                 );
             }
         }
-
-        // Backward-compatible event (preserve `blacklist` for additional publishes)
         env.events().publish(
             (EVENT_REVENUE_REPORTED, issuer.clone(), token.clone()),
             (amount, period_id, blacklist.clone()),
@@ -683,6 +708,18 @@ impl RevoraRevenueShare {
         Ok(())
     }
 
+    pub fn get_revenue_by_period(env: Env, token: Address, period_id: u64) -> i128 {
+        let key = DataKey::RevenueIndex(token, period_id);
+        env.storage().persistent().get(&key).unwrap_or(0)
+    }
+
+    pub fn get_revenue_range(env: Env, token: Address, from_period: u64, to_period: u64) -> i128 {
+        let mut total: i128 = 0;
+        for period in from_period..=to_period {
+            total += Self::get_revenue_by_period(env.clone(), token.clone(), period);
+        }
+        total
+    }
     /// Return the total number of offerings registered by `issuer`.
     pub fn get_offering_count(env: Env, issuer: Address) -> u32 {
         let count_key = DataKey::OfferCount(issuer);
