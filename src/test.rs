@@ -72,7 +72,7 @@ fn closing_a_period_rejects_further_reports() {
     let before = env.events().all().len();
     client.close_period(&issuer, &token, &1);
     assert!(client.is_period_closed(&issuer, &token, &1));
-    assert!(env.events().all().len() >= before + 1);
+    assert!(env.events().all().len() > before);
 
     // Another report for the closed period will panic (covered in a dedicated #[should_panic] test).
 }
