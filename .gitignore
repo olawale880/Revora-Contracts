@@ -1,30 +1,6 @@
-# Rust build output
-/target
-
-# Cargo lock (library crate — uncomment if this is a binary crate)
+/target/
 Cargo.lock
-
-# Soroban compiled WASM output
-*.wasm
-*.wasm.gz
-
-# Soroban local state
-.soroban/
-
-# Test snapshots (generated — do not commit)
+test_snapshots/
+target/
 test_snapshots/
 
-# Environment variables
-.env
-.env.local
-
-# macOS
-.DS_Store
-Thumbs.db
-
-# IDE / editor
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
