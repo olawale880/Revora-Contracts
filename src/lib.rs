@@ -43,6 +43,10 @@ pub enum RevoraError {
     PayoutAssetMismatch = 15,
     /// Metadata string exceeds maximum allowed length.
     MetadataTooLarge = 16,
+    /// Amount is invalid (e.g. negative for deposit, or out of allowed range) (#35).
+    InvalidAmount = 17,
+    /// period_id is invalid (e.g. zero when required to be positive) (#35).
+    InvalidPeriodId = 18,
 }
 
 // ── Event symbols ────────────────────────────────────────────
@@ -81,10 +85,16 @@ const EVENT_UNPAUSED: Symbol = symbol_short!("unpaused");
 const EVENT_DIST_CALC: Symbol = symbol_short!("dist_calc");
 const EVENT_METADATA_SET: Symbol = symbol_short!("meta_set");
 const EVENT_METADATA_UPDATED: Symbol = symbol_short!("meta_upd");
+/// Emitted when per-offering minimum revenue threshold is set or changed (#25).
+const EVENT_MIN_REV_THRESHOLD_SET: Symbol = symbol_short!("min_rev");
+/// Emitted when reported revenue is below the offering's minimum threshold; no distribution triggered (#25).
+const EVENT_REV_BELOW_THRESHOLD: Symbol = symbol_short!("rev_below");
 
 const BPS_DENOMINATOR: i128 = 10_000;
 
 // ── Data structures ──────────────────────────────────────────
+/// Contract version identifier (#23). Bumped when storage or semantics change; used for migration and compatibility.
+pub const CONTRACT_VERSION: u32 = 1;
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -111,6 +121,16 @@ pub struct ConcentrationLimitConfig {
 pub struct AuditSummary {
     pub total_revenue: i128,
     pub report_count: u64,
+}
+
+/// Cross-offering aggregated metrics (#39).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AggregatedMetrics {
+    pub total_reported_revenue: i128,
+    pub total_deposited_revenue: i128,
+    pub total_report_count: u64,
+    pub offering_count: u32,
 }
 
 /// Result of simulate_distribution (#29): per-holder payout and total.
@@ -141,6 +161,8 @@ pub enum RoundingMode {
 #[contracttype]
 pub enum DataKey {
     Blacklist(Address),
+    /// Per-token: blacklist addresses in insertion order for deterministic get_blacklist (#38).
+    BlacklistOrder(Address),
     OfferCount(Address),
     OfferItem(Address, u32),
     /// Per (issuer, token): concentration limit config.
@@ -191,6 +213,16 @@ pub enum DataKey {
     OfferingMetadata(Address, Address),
     /// Platform fee in basis points (max 5000 = 50%) taken from reported revenue (#6).
     PlatformFeeBps,
+    /// Per (issuer, token): minimum revenue per period below which no distribution is triggered (#25).
+    MinRevenueThreshold(Address, Address),
+    /// Global count of unique issuers (#39).
+    IssuerCount,
+    /// Issuer address at global index (#39).
+    IssuerItem(u32),
+    /// Whether an issuer is already registered in the global registry (#39).
+    IssuerRegistered(Address),
+    /// Total deposited revenue for an offering token (#39).
+    DepositedRevenue(Address),
 }
 
 /// Maximum number of offerings returned in a single page.
@@ -227,6 +259,30 @@ impl RevoraRevenueShare {
             .unwrap_or(false)
         {
             return Err(RevoraError::ContractFrozen);
+        }
+        Ok(())
+    }
+
+    /// Input validation (#35): require amount > 0 for transfers/deposits.
+    fn require_positive_amount(amount: i128) -> Result<(), RevoraError> {
+        if amount <= 0 {
+            return Err(RevoraError::InvalidAmount);
+        }
+        Ok(())
+    }
+
+    /// Input validation (#35): require period_id > 0 where 0 would be ambiguous.
+    fn require_valid_period_id(period_id: u64) -> Result<(), RevoraError> {
+        if period_id == 0 {
+            return Err(RevoraError::InvalidPeriodId);
+        }
+        Ok(())
+    }
+
+    /// Input validation (#35): require amount >= 0 for reporting (allow zero revenue report).
+    fn require_non_negative_amount(amount: i128) -> Result<(), RevoraError> {
+        if amount < 0 {
+            return Err(RevoraError::InvalidAmount);
         }
         Ok(())
     }
@@ -372,6 +428,25 @@ impl RevoraRevenueShare {
         let issuer_lookup_key = DataKey::OfferingIssuer(token.clone());
         env.storage().persistent().set(&issuer_lookup_key, &issuer);
 
+        // Track issuer in global registry for cross-offering aggregation (#39)
+        let registered_key = DataKey::IssuerRegistered(issuer.clone());
+        if !env.storage().persistent().has(&registered_key) {
+            let issuer_count_key = DataKey::IssuerCount;
+            let issuer_count: u32 = env
+                .storage()
+                .persistent()
+                .get(&issuer_count_key)
+                .unwrap_or(0);
+            let issuer_item_key = DataKey::IssuerItem(issuer_count);
+            env.storage()
+                .persistent()
+                .set(&issuer_item_key, &issuer.clone());
+            env.storage()
+                .persistent()
+                .set(&issuer_count_key, &(issuer_count + 1));
+            env.storage().persistent().set(&registered_key, &true);
+        }
+
         env.events().publish(
             (symbol_short!("offer_reg"), issuer.clone()),
             (token.clone(), revenue_share_bps, payout_asset.clone()),
@@ -443,10 +518,23 @@ impl RevoraRevenueShare {
         Self::require_not_paused(&env);
         issuer.require_auth();
 
+        Self::require_non_negative_amount(amount)?;
+
         let offering = Self::get_offering(env.clone(), issuer.clone(), token.clone())
             .ok_or(RevoraError::OfferingNotFound)?;
         if offering.payout_asset != payout_asset {
             return Err(RevoraError::PayoutAssetMismatch);
+        }
+
+        // Per-offering minimum revenue threshold (#25): skip distribution when below threshold
+        let min_threshold =
+            Self::get_min_revenue_threshold(env.clone(), issuer.clone(), token.clone());
+        if min_threshold > 0 && amount < min_threshold {
+            env.events().publish(
+                (EVENT_REV_BELOW_THRESHOLD, issuer, token),
+                (amount, period_id, min_threshold),
+            );
+            return Ok(());
         }
 
         // Skip concentration enforcement in testnet mode
@@ -639,6 +727,7 @@ impl RevoraRevenueShare {
     }
 
     /// Return a page of offerings for `issuer`. Limit capped at MAX_PAGE_LIMIT (20).
+    /// Ordering: by registration index (creation order), deterministic (#38).
     pub fn get_offerings_page(
         env: Env,
         issuer: Address,
@@ -688,8 +777,21 @@ impl RevoraRevenueShare {
             .get(&key)
             .unwrap_or_else(|| Map::new(&env));
 
+        let was_present = map.get(investor.clone()).unwrap_or(false);
         map.set(investor.clone(), true);
         env.storage().persistent().set(&key, &map);
+
+        // Maintain insertion order for deterministic get_blacklist (#38)
+        if !was_present {
+            let order_key = DataKey::BlacklistOrder(token.clone());
+            let mut order: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&order_key)
+                .unwrap_or_else(|| Vec::new(&env));
+            order.push_back(investor.clone());
+            env.storage().persistent().set(&order_key, &order);
+        }
 
         env.events()
             .publish((EVENT_BL_ADD, token, caller), investor);
@@ -717,6 +819,22 @@ impl RevoraRevenueShare {
         map.remove(investor.clone());
         env.storage().persistent().set(&key, &map);
 
+        // Rebuild order vec so get_blacklist stays deterministic (#38)
+        let order_key = DataKey::BlacklistOrder(token.clone());
+        let old_order: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&order_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut new_order = Vec::new(&env);
+        for i in 0..old_order.len() {
+            let addr = old_order.get(i).unwrap();
+            if map.get(addr.clone()).unwrap_or(false) {
+                new_order.push_back(addr);
+            }
+        }
+        env.storage().persistent().set(&order_key, &new_order);
+
         env.events()
             .publish((EVENT_BL_REM, token, caller), investor);
         Ok(())
@@ -733,12 +851,12 @@ impl RevoraRevenueShare {
     }
 
     /// Return all blacklisted addresses for `token`'s offering.
+    /// Ordering: by insertion order, deterministic and stable across calls (#38).
     pub fn get_blacklist(env: Env, token: Address) -> Vec<Address> {
-        let key = DataKey::Blacklist(token);
+        let order_key = DataKey::BlacklistOrder(token);
         env.storage()
             .persistent()
-            .get::<DataKey, Map<Address, bool>>(&key)
-            .map(|m| m.keys())
+            .get::<DataKey, Vec<Address>>(&order_key)
             .unwrap_or_else(|| Vec::new(&env))
     }
 
@@ -869,6 +987,47 @@ impl RevoraRevenueShare {
             .unwrap_or(RoundingMode::Truncation)
     }
 
+    // ── Per-offering minimum revenue threshold (#25) ─────────────────────
+
+    /// Set minimum revenue per period below which no distribution is triggered.
+    /// Only the offering issuer may set this. Emits event when configured or changed.
+    /// Pass 0 to disable the threshold.
+    pub fn set_min_revenue_threshold(
+        env: Env,
+        issuer: Address,
+        token: Address,
+        min_amount: i128,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+
+        let current_issuer =
+            Self::get_current_issuer(&env, &token).ok_or(RevoraError::OfferingNotFound)?;
+
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
+
+        issuer.require_auth();
+
+        Self::require_non_negative_amount(min_amount)?;
+
+        let key = DataKey::MinRevenueThreshold(issuer.clone(), token.clone());
+        let previous: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage().persistent().set(&key, &min_amount);
+
+        env.events().publish(
+            (EVENT_MIN_REV_THRESHOLD_SET, issuer, token),
+            (previous, min_amount),
+        );
+        Ok(())
+    }
+
+    /// Get minimum revenue threshold for an offering. 0 means no threshold.
+    pub fn get_min_revenue_threshold(env: Env, issuer: Address, token: Address) -> i128 {
+        let key = DataKey::MinRevenueThreshold(issuer, token);
+        env.storage().persistent().get(&key).unwrap_or(0)
+    }
+
     /// Compute share of `amount` at `revenue_share_bps` using the given rounding mode.
     /// Guarantees: result between 0 and amount (inclusive); no loss of funds when summing shares if caller uses same mode.
     pub fn compute_share(
@@ -934,6 +1093,9 @@ impl RevoraRevenueShare {
 
         issuer.require_auth();
 
+        Self::require_positive_amount(amount)?;
+        Self::require_valid_period_id(period_id)?;
+
         // Check period not already deposited
         let rev_key = DataKey::PeriodRevenue(token.clone(), period_id);
         if env.storage().persistent().has(&rev_key) {
@@ -956,6 +1118,13 @@ impl RevoraRevenueShare {
 
         // Store period revenue
         env.storage().persistent().set(&rev_key, &amount);
+
+        // Track total deposited revenue per offering (#39)
+        let deposited_key = DataKey::DepositedRevenue(token.clone());
+        let total_deposited: i128 = env.storage().persistent().get(&deposited_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&deposited_key, &total_deposited.saturating_add(amount));
 
         // Store deposit timestamp for time-delayed claims (#27)
         let deposit_time = env.ledger().timestamp();
@@ -1112,6 +1281,7 @@ impl RevoraRevenueShare {
     }
 
     /// Return unclaimed period IDs for a holder on an offering.
+    /// Ordering: by deposit index (creation order), deterministic (#38).
     pub fn get_pending_periods(env: Env, token: Address, holder: Address) -> Vec<u64> {
         let count_key = DataKey::PeriodCount(token.clone());
         let period_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
@@ -1638,6 +1808,110 @@ impl RevoraRevenueShare {
             .unwrap_or(false)
     }
 
+    // ── Cross-offering aggregation queries (#39) ──────────────────
+
+    /// Maximum number of issuers to iterate for platform-wide aggregation.
+    const MAX_AGGREGATION_ISSUERS: u32 = 50;
+
+    /// Aggregate metrics across all offerings for a single issuer.
+    /// Iterates the issuer's offerings and sums audit summary and deposited revenue data.
+    pub fn get_issuer_aggregation(env: Env, issuer: Address) -> AggregatedMetrics {
+        let count = Self::get_offering_count(env.clone(), issuer.clone());
+        let mut total_reported: i128 = 0;
+        let mut total_deposited: i128 = 0;
+        let mut total_reports: u64 = 0;
+
+        for i in 0..count {
+            let item_key = DataKey::OfferItem(issuer.clone(), i);
+            let offering: Offering = env.storage().persistent().get(&item_key).unwrap();
+
+            // Sum audit summary (reported revenue)
+            let summary_key = DataKey::AuditSummary(issuer.clone(), offering.token.clone());
+            if let Some(summary) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, AuditSummary>(&summary_key)
+            {
+                total_reported = total_reported.saturating_add(summary.total_revenue);
+                total_reports = total_reports.saturating_add(summary.report_count);
+            }
+
+            // Sum deposited revenue
+            let deposited_key = DataKey::DepositedRevenue(offering.token.clone());
+            let deposited: i128 = env.storage().persistent().get(&deposited_key).unwrap_or(0);
+            total_deposited = total_deposited.saturating_add(deposited);
+        }
+
+        AggregatedMetrics {
+            total_reported_revenue: total_reported,
+            total_deposited_revenue: total_deposited,
+            total_report_count: total_reports,
+            offering_count: count,
+        }
+    }
+
+    /// Aggregate metrics across all issuers (platform-wide).
+    /// Iterates the global issuer registry, capped at MAX_AGGREGATION_ISSUERS for gas safety.
+    pub fn get_platform_aggregation(env: Env) -> AggregatedMetrics {
+        let issuer_count_key = DataKey::IssuerCount;
+        let issuer_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&issuer_count_key)
+            .unwrap_or(0);
+
+        let cap = core::cmp::min(issuer_count, Self::MAX_AGGREGATION_ISSUERS);
+
+        let mut total_reported: i128 = 0;
+        let mut total_deposited: i128 = 0;
+        let mut total_reports: u64 = 0;
+        let mut total_offerings: u32 = 0;
+
+        for i in 0..cap {
+            let issuer_item_key = DataKey::IssuerItem(i);
+            let issuer: Address = env.storage().persistent().get(&issuer_item_key).unwrap();
+
+            let metrics = Self::get_issuer_aggregation(env.clone(), issuer);
+            total_reported = total_reported.saturating_add(metrics.total_reported_revenue);
+            total_deposited = total_deposited.saturating_add(metrics.total_deposited_revenue);
+            total_reports = total_reports.saturating_add(metrics.total_report_count);
+            total_offerings = total_offerings.saturating_add(metrics.offering_count);
+        }
+
+        AggregatedMetrics {
+            total_reported_revenue: total_reported,
+            total_deposited_revenue: total_deposited,
+            total_report_count: total_reports,
+            offering_count: total_offerings,
+        }
+    }
+
+    /// Return all registered issuer addresses (up to MAX_AGGREGATION_ISSUERS).
+    pub fn get_all_issuers(env: Env) -> Vec<Address> {
+        let issuer_count_key = DataKey::IssuerCount;
+        let issuer_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&issuer_count_key)
+            .unwrap_or(0);
+
+        let cap = core::cmp::min(issuer_count, Self::MAX_AGGREGATION_ISSUERS);
+        let mut issuers = Vec::new(&env);
+
+        for i in 0..cap {
+            let issuer_item_key = DataKey::IssuerItem(i);
+            let issuer: Address = env.storage().persistent().get(&issuer_item_key).unwrap();
+            issuers.push_back(issuer);
+        }
+        issuers
+    }
+
+    /// Return the total deposited revenue for a specific offering token.
+    pub fn get_total_deposited_revenue(env: Env, token: Address) -> i128 {
+        let key = DataKey::DepositedRevenue(token);
+        env.storage().persistent().get(&key).unwrap_or(0)
+    }
+
     // ── Platform fee configuration (#6) ────────────────────────
 
     /// Set the platform fee in basis points.  Admin-only.
@@ -1672,6 +1946,12 @@ impl RevoraRevenueShare {
     pub fn calculate_platform_fee(env: Env, amount: i128) -> i128 {
         let fee_bps = Self::get_platform_fee(env) as i128;
         (amount * fee_bps).checked_div(BPS_DENOMINATOR).unwrap_or(0)
+    }
+
+    /// Return the current contract version (#23). Used for upgrade compatibility and migration.
+    pub fn get_version(env: Env) -> u32 {
+        let _ = env;
+        CONTRACT_VERSION
     }
 }
 
